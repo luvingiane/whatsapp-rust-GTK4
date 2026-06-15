@@ -1,0 +1,49 @@
+[package]
+name = "whatsapp-rust-gtk4"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "GPL-3.0-or-later"
+description = "Native GTK4 + libadwaita WhatsApp client written in Rust"
+repository = "https://github.com/Matt/whatsapp-rust-GTK4"
+default-run = "whatsapp-rust-gtk4"
+
+[dependencies]
+# --- GTK / libadwaita -------------------------------------------------------
+gtk = { package = "gtk4", version = "0.9", features = ["v4_12"] }
+libadwaita = { version = "0.7", features = ["v1_4"] }
+
+# --- WhatsApp protocol backend (pinned exact: young crate, breaking changes) -
+# `simd` is intentionally NOT enabled: it pulls `portable_simd`, which requires a
+# nightly toolchain. We stick to stable, so we opt out of default features and
+# re-enable everything except `simd`.
+whatsapp-rust = { version = "=0.6.0", default-features = false, features = [
+    "moka-cache",
+    "sqlite-storage",
+    "tokio-transport",
+    "tokio-runtime",
+    "ureq-client",
+    "tokio-native",
+    "signal",
+] }
+whatsapp-rust-sqlite-storage = "=0.6.0"
+whatsapp-rust-tokio-transport = "=0.6.0"
+whatsapp-rust-ureq-http-client = "=0.6.0"
+# Only needed for the `Event` type; default features would re-enable `simd`.
+wacore = { version = "=0.6.0", default-features = false }
+
+# --- async runtime + bridge -------------------------------------------------
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+async-channel = "2"
+
+# --- QR rendering (we rasterize the module matrix ourselves, no image dep) ---
+qrcode = { version = "0.14", default-features = false }
+
+# --- errors + logging -------------------------------------------------------
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+
+[profile.release]
+lto = "thin"
+strip = true
