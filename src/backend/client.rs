@@ -7,15 +7,18 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_channel::{Receiver, Sender};
 use log::{error, info, warn};
+use wacore::store::DevicePropsOverride;
 use wacore::types::events::Event;
 use whatsapp_rust::bot::Bot;
 use whatsapp_rust::client::Client;
+use whatsapp_rust::waproto::whatsapp::device_props::PlatformType;
 use whatsapp_rust::TokioRuntime;
 use whatsapp_rust_sqlite_storage::SqliteStore;
 use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
 use whatsapp_rust_ureq_http_client::UreqHttpClient;
 
 use super::bridge::{WaCommand, WaEvent};
+use crate::config;
 
 /// Builds the bot against the SQLite session DB and drives its run loop until it
 /// ends or a [`WaCommand::Shutdown`] arrives.
@@ -39,6 +42,13 @@ pub async fn run(
         .with_transport_factory(TokioWebSocketTransportFactory::new())
         .with_http_client(UreqHttpClient::new())
         .with_runtime(TokioRuntime)
+        // Present as "Google Chrome (Linux)" in the phone's Linked Devices list
+        // instead of an "unknown device". Sent only at pairing; cosmetic only.
+        .with_device_props(
+            DevicePropsOverride::new()
+                .with_os(config::DEVICE_OS)
+                .with_platform_type(PlatformType::Chrome),
+        )
         .on_event(move |event, client| {
             let tx = ev_tx.clone();
             async move {

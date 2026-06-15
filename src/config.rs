@@ -10,6 +10,13 @@ pub const APP_ID: &str = "io.github.matt.WhatsAppRustGtk";
 /// Human-readable application name shown in logs and the window title.
 pub const APP_NAME: &str = "WhatsApp (Rust/GTK4)";
 
+/// OS string advertised to WhatsApp in the device registration props. Combined
+/// with `PlatformType::Chrome` (set in the backend) it makes this client appear
+/// as "Google Chrome (Linux)" in the phone's Linked Devices list, instead of an
+/// "unknown device". This is sent only at pairing time, so changing it requires
+/// re-pairing to take effect. It is cosmetic — it does not make us a real browser.
+pub const DEVICE_OS: &str = "Linux";
+
 /// Subdirectory under the XDG data dir where we keep all app state.
 const DATA_SUBDIR: &str = "whatsapp-rust-gtk4";
 
