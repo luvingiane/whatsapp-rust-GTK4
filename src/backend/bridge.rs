@@ -9,6 +9,8 @@
 
 use async_channel::{Receiver, Sender};
 
+use crate::model::ChatSummary;
+
 /// Events flowing **from** the WhatsApp backend (Tokio thread) **to** the GTK UI.
 #[derive(Debug, Clone)]
 pub enum WaEvent {
@@ -26,6 +28,9 @@ pub enum WaEvent {
     LoggedOut,
     /// A non-fatal backend problem worth surfacing to the user.
     Error(String),
+    /// The full, ordered chat list (sidebar). Sent after history sync and,
+    /// debounced, whenever the store changes.
+    ChatsSnapshot(Vec<ChatSummary>),
 }
 
 /// Commands flowing **from** the GTK UI **to** the WhatsApp backend.

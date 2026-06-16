@@ -6,6 +6,8 @@
 mod app;
 mod backend;
 mod config;
+mod model;
+mod store;
 mod ui;
 mod util;
 

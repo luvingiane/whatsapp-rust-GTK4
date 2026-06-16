@@ -23,6 +23,11 @@ const DATA_SUBDIR: &str = "whatsapp-rust-gtk4";
 /// File name of the whatsapp-rust SQLite session/keys database.
 const SESSION_DB_FILE: &str = "whatsapp.db";
 
+/// File name of OUR application state database (chat list, later messages).
+/// Kept separate from `whatsapp.db` so we never interfere with whatsapp-rust's
+/// own diesel-managed schema/migrations.
+const APP_DB_FILE: &str = "app.db";
+
 /// Returns the absolute path to the session database, creating its parent
 /// directory if necessary. On Linux this resolves to
 /// `~/.local/share/whatsapp-rust-gtk4/whatsapp.db`.
@@ -31,9 +36,20 @@ const SESSION_DB_FILE: &str = "whatsapp.db";
 /// session, identity keys and device registration. It is the reason the app can
 /// reconnect on restart without re-scanning the QR code.
 pub fn session_db_path() -> anyhow::Result<PathBuf> {
+    data_file(SESSION_DB_FILE)
+}
+
+/// Returns the absolute path to OUR application database
+/// (`~/.local/share/whatsapp-rust-gtk4/app.db`), creating the parent dir.
+pub fn app_db_path() -> anyhow::Result<PathBuf> {
+    data_file(APP_DB_FILE)
+}
+
+/// Resolves `<XDG data>/whatsapp-rust-gtk4/<file>`, creating the directory.
+fn data_file(file: &str) -> anyhow::Result<PathBuf> {
     let mut dir = glib::user_data_dir();
     dir.push(DATA_SUBDIR);
     std::fs::create_dir_all(&dir)?;
-    dir.push(SESSION_DB_FILE);
+    dir.push(file);
     Ok(dir)
 }
