@@ -81,30 +81,6 @@ impl LoginView {
         ));
     }
 
-    /// Pairing accepted, finishing the connection.
-    pub fn show_connecting(&self) {
-        self.picture.set_visible(false);
-        self.spinner.set_visible(true);
-        self.spinner.start();
-        self.root.set_icon_name(Some("dialog-information-symbolic"));
-        self.root.set_title("Connessione…");
-        self.root.set_description(Some("Accesso in corso"));
-    }
-
-    /// Fully connected. `jid` is our own number, when known.
-    pub fn show_connected(&self, jid: Option<&str>) {
-        self.picture.set_visible(false);
-        self.spinner.stop();
-        self.spinner.set_visible(false);
-        self.root.set_icon_name(Some("emblem-ok-symbolic"));
-        self.root.set_title("Connesso");
-        let desc = match jid {
-            Some(j) => format!("Connesso come {j}"),
-            None => "Sessione attiva".to_string(),
-        };
-        self.root.set_description(Some(&desc));
-    }
-
     /// Surface a backend error without crashing.
     pub fn show_error(&self, msg: &str) {
         self.picture.set_visible(false);

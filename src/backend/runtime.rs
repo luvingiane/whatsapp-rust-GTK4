@@ -9,7 +9,12 @@ use super::bridge::{WaCommand, WaEvent};
 /// Spawns a background OS thread hosting a multi-threaded Tokio runtime and runs
 /// the WhatsApp client on it. Returns immediately; results flow back over
 /// `event_tx`. The thread lives for the duration of the process.
-pub fn spawn(db_path: String, event_tx: Sender<WaEvent>, command_rx: Receiver<WaCommand>) {
+pub fn spawn(
+    db_path: String,
+    app_db_path: String,
+    event_tx: Sender<WaEvent>,
+    command_rx: Receiver<WaCommand>,
+) {
     std::thread::Builder::new()
         .name("wa-tokio".into())
         .spawn(move || {
@@ -27,7 +32,9 @@ pub fn spawn(db_path: String, event_tx: Sender<WaEvent>, command_rx: Receiver<Wa
             };
 
             rt.block_on(async move {
-                if let Err(e) = super::client::run(db_path, event_tx.clone(), command_rx).await {
+                if let Err(e) =
+                    super::client::run(db_path, app_db_path, event_tx.clone(), command_rx).await
+                {
                     error!("WhatsApp backend exited with error: {e:?}");
                     let _ = event_tx
                         .send(WaEvent::Error(format!("Errore del backend: {e}")))
