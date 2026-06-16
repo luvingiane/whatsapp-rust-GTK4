@@ -18,7 +18,8 @@ libadwaita = { version = "0.7", features = ["v1_4"] }
 # nightly toolchain. We stick to stable, so we opt out of default features and
 # re-enable everything except `simd`.
 whatsapp-rust = { version = "=0.6.0", default-features = false, features = [
-    "moka-cache",
+    # NOTE: `moka-cache` was removed upstream after 0.6.0; the cache now falls
+    # back to the portable backend. Do not re-add here.
     "sqlite-storage",
     "tokio-transport",
     "tokio-runtime",
@@ -37,10 +38,12 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 async-channel = "2"
 
 # --- application state DB (our own chat/message store) -----------------------
-# rusqlite 0.38 depends on libsqlite3-sys ^0.36 — the SAME (bundled) version
-# pulled by whatsapp-rust-sqlite-storage — so SQLite is compiled and linked once
-# (no duplicate-symbol conflict). Do not bump without re-checking that match.
-rusqlite = "=0.38.0"
+# rusqlite must share the SAME libsqlite3-sys (bundled) that whatsapp-rust's
+# sqlite-storage pulls, so SQLite is compiled and linked once (no duplicate
+# `links = "sqlite3"` conflict). The pinned whatsapp-rust revision (see the
+# [patch] block) uses libsqlite3-sys ^0.37, which rusqlite 0.39 also uses.
+# Re-check this match whenever bumping either pin.
+rusqlite = "=0.39.0"
 
 # --- QR rendering (we rasterize the module matrix ourselves, no image dep) ---
 qrcode = { version = "0.14", default-features = false }
@@ -53,3 +56,16 @@ env_logger = "0.11"
 [profile.release]
 lto = "thin"
 strip = true
+
+# whatsapp-rust is pinned to a git revision (no published release past 0.6.0):
+# the released 0.6.0 fails the post-login critical app-state sync ("didn't find
+# app state key"), which the HEAD code fixes — unlocking Connected, saved contact
+# names, and archived/pin/mute state. All workspace crates are pinned to ONE
+# revision so they resolve together. Bump deliberately (young, fast-moving).
+[patch.crates-io]
+whatsapp-rust = { git = "https://github.com/jlucaso1/whatsapp-rust", rev = "d441e5fa2d09b5aaaef966d00fa7d18e7df04a30" }
+wacore = { git = "https://github.com/jlucaso1/whatsapp-rust", rev = "d441e5fa2d09b5aaaef966d00fa7d18e7df04a30" }
+waproto = { git = "https://github.com/jlucaso1/whatsapp-rust", rev = "d441e5fa2d09b5aaaef966d00fa7d18e7df04a30" }
+whatsapp-rust-sqlite-storage = { git = "https://github.com/jlucaso1/whatsapp-rust", rev = "d441e5fa2d09b5aaaef966d00fa7d18e7df04a30" }
+whatsapp-rust-tokio-transport = { git = "https://github.com/jlucaso1/whatsapp-rust", rev = "d441e5fa2d09b5aaaef966d00fa7d18e7df04a30" }
+whatsapp-rust-ureq-http-client = { git = "https://github.com/jlucaso1/whatsapp-rust", rev = "d441e5fa2d09b5aaaef966d00fa7d18e7df04a30" }
