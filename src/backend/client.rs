@@ -255,8 +255,66 @@ async fn handle_event(
                 dirty.notify_one();
             }
         }
+        // App-state full-sync (and live) updates: archive/pin/mute + the saved
+        // address-book name. JIDs may be LID-form, so normalize to the chat key.
+        Event::ArchiveUpdate(a) => {
+            let jid = normalize_chat_jid(&client, &a.jid).await;
+            let archived = a.action.archived.unwrap_or(false);
+            if let Err(e) = store.set_archived(jid, archived).await {
+                warn!("set_archived failed: {e:?}");
+            }
+            dirty.notify_one();
+        }
+        Event::PinUpdate(p) => {
+            let jid = normalize_chat_jid(&client, &p.jid).await;
+            let pinned = p.action.pinned.unwrap_or(false);
+            if let Err(e) = store.set_pinned(jid, pinned).await {
+                warn!("set_pinned failed: {e:?}");
+            }
+            dirty.notify_one();
+        }
+        Event::MuteUpdate(m) => {
+            let jid = normalize_chat_jid(&client, &m.jid).await;
+            let muted = m.action.muted.unwrap_or(false);
+            let until = m.action.mute_end_timestamp.unwrap_or(0);
+            if let Err(e) = store.set_muted(jid, muted, until).await {
+                warn!("set_muted failed: {e:?}");
+            }
+            dirty.notify_one();
+        }
+        Event::ContactUpdate(c) => {
+            let jid = normalize_chat_jid(&client, &c.jid).await;
+            let name = c
+                .action
+                .full_name
+                .clone()
+                .filter(|s| !s.is_empty())
+                .or_else(|| c.action.first_name.clone())
+                .unwrap_or_default();
+            if !name.is_empty() {
+                if let Err(e) = store.set_saved_name(jid, name).await {
+                    warn!("set_saved_name failed: {e:?}");
+                }
+                dirty.notify_one();
+            }
+        }
         _ => {}
     }
+}
+
+/// Normalizes an app-state event JID to our chat-list key. App-state events can
+/// reference a contact by LID (`@lid`), while our chats are keyed by phone-number
+/// JID (`@s.whatsapp.net`); resolve LID→phone via whatsapp-rust's cache. Group
+/// and phone-number JIDs pass through unchanged.
+async fn normalize_chat_jid(client: &Client, jid: &whatsapp_rust::Jid) -> String {
+    if jid.is_lid() {
+        if let Ok(Some(entry)) = client.get_lid_pn_entry(jid).await {
+            if !entry.phone_number.is_empty() {
+                return format!("{}@s.whatsapp.net", entry.phone_number);
+            }
+        }
+    }
+    jid.to_string()
 }
 
 /// Whether a JID is a normal user/group chat we show in the list (excludes

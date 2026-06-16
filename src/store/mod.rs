@@ -30,6 +30,16 @@ CREATE TABLE IF NOT EXISTS contacts (
   jid  TEXT PRIMARY KEY,
   name TEXT NOT NULL DEFAULT ''
 );
+-- App-state metadata keyed by chat JID, written by app-state events
+-- independently of whether the chat row exists yet (avoids ordering races and
+-- the history-sync overwrite). Resolved via LEFT JOIN at read time.
+CREATE TABLE IF NOT EXISTS chat_meta (
+  jid         TEXT PRIMARY KEY,
+  archived    INTEGER NOT NULL DEFAULT 0,
+  pinned      INTEGER NOT NULL DEFAULT 0,
+  muted_until INTEGER NOT NULL DEFAULT 0,
+  saved_name  TEXT NOT NULL DEFAULT ''
+);
 ";
 
 /// An owned chat row to upsert. We extract these from the (borrowed) protobuf on
@@ -177,22 +187,87 @@ impl Store {
         .await?
     }
 
+    /// Sets the saved (address-book) name for a chat, from a `ContactAction`.
+    pub async fn set_saved_name(&self, jid: String, name: String) -> Result<()> {
+        if name.is_empty() {
+            return Ok(());
+        }
+        self.set_meta(
+            "INSERT INTO chat_meta (jid, saved_name) VALUES (?1, ?2)
+             ON CONFLICT(jid) DO UPDATE SET saved_name=?2",
+            jid,
+            name,
+        )
+        .await
+    }
+
+    /// Sets the archived flag for a chat, from an `ArchiveChatAction`.
+    pub async fn set_archived(&self, jid: String, archived: bool) -> Result<()> {
+        self.set_meta(
+            "INSERT INTO chat_meta (jid, archived) VALUES (?1, ?2)
+             ON CONFLICT(jid) DO UPDATE SET archived=?2",
+            jid,
+            archived as i64,
+        )
+        .await
+    }
+
+    /// Sets the pinned flag for a chat, from a `PinAction`.
+    pub async fn set_pinned(&self, jid: String, pinned: bool) -> Result<()> {
+        self.set_meta(
+            "INSERT INTO chat_meta (jid, pinned) VALUES (?1, ?2)
+             ON CONFLICT(jid) DO UPDATE SET pinned=?2",
+            jid,
+            pinned as i64,
+        )
+        .await
+    }
+
+    /// Sets the mute end timestamp for a chat (0 = not muted), from a `MuteAction`.
+    pub async fn set_muted(&self, jid: String, muted: bool, until: i64) -> Result<()> {
+        let value = if muted { until.max(1) } else { 0 };
+        self.set_meta(
+            "INSERT INTO chat_meta (jid, muted_until) VALUES (?1, ?2)
+             ON CONFLICT(jid) DO UPDATE SET muted_until=?2",
+            jid,
+            value,
+        )
+        .await
+    }
+
+    /// Upserts one `chat_meta` column for `jid` (?1) with value `?2`. Works even
+    /// if the chat row doesn't exist yet — metadata is keyed independently.
+    async fn set_meta<V>(&self, sql: &'static str, jid: String, value: V) -> Result<()>
+    where
+        V: rusqlite::ToSql + Send + 'static,
+    {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let guard = conn.lock().map_err(|_| anyhow!("store mutex poisoned"))?;
+            guard.execute(sql, params![jid, value])?;
+            Ok(())
+        })
+        .await?
+    }
+
     /// Returns the non-archived chats, pinned first then most-recent first.
     pub async fn list_chats(&self) -> Result<Vec<ChatSummary>> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || -> Result<Vec<ChatSummary>> {
             let guard = conn.lock().map_err(|_| anyhow!("store mutex poisoned"))?;
-            // Resolve the display name: the chat's own name (group subject /
-            // saved name) wins; otherwise the contact pushname; otherwise the
-            // number is filled in below.
+            // Resolve the display name: group subject → saved address-book name
+            // → contact pushname → (number, filled in below). Archive/pin come
+            // from chat_meta (app-state), independent of the chat row.
             let mut stmt = guard.prepare(
                 "SELECT c.jid,
-                        COALESCE(NULLIF(c.name,''), NULLIF(ct.name,''), '') AS name,
-                        c.last_message, c.last_ts, c.last_from_me, c.unread, c.is_group, c.pinned
+                        COALESCE(NULLIF(c.name,''), NULLIF(m.saved_name,''), NULLIF(ct.name,''), '') AS name,
+                        c.last_message, c.last_ts, c.last_from_me, c.unread, c.is_group,
+                        COALESCE(m.pinned,0) AS pinned
                  FROM chats c
                  LEFT JOIN contacts ct ON ct.jid = c.jid
-                 WHERE c.archived=0
-                 ORDER BY c.pinned DESC, c.last_ts DESC",
+                 LEFT JOIN chat_meta m ON m.jid = c.jid
+                 WHERE COALESCE(m.archived,0)=0
+                 ORDER BY pinned DESC, c.last_ts DESC",
             )?;
             let rows = stmt
                 .query_map([], |r| {
