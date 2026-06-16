@@ -43,7 +43,9 @@ pub async fn run(
     info!("opening session database at {db_path}");
     // SqliteStore enables WAL journaling and runs migrations on open, so session
     // and keys are persisted atomically across restarts.
-    let backend = Arc::new(SqliteStore::new(&db_path).await?);
+    // HEAD: with_backend takes `impl Backend` (SqliteStore impls it directly) —
+    // no Arc wrapper anymore.
+    let backend = SqliteStore::new(&db_path).await?;
 
     info!("opening app database at {app_db_path}");
     let store = Store::open(app_db_path).await?;
@@ -78,7 +80,7 @@ pub async fn run(
     let ev_tx = event_tx.clone();
     let ev_store = store.clone();
     let ev_dirty = dirty.clone();
-    let mut bot = Bot::builder()
+    let bot = Bot::builder()
         .with_backend(backend)
         .with_transport_factory(TokioWebSocketTransportFactory::new())
         .with_http_client(UreqHttpClient::new())
@@ -101,25 +103,25 @@ pub async fn run(
         .build()
         .await?;
 
-    // `run` starts the connection/handshake and returns a future that resolves
-    // when the run loop finishes. whatsapp-rust handles reconnection internally.
-    let handle = bot.run().await?;
+    // `spawn` starts the connection/handshake on the runtime and returns a handle
+    // that resolves when the run loop exits. whatsapp-rust handles reconnection.
+    let mut handle = bot.spawn();
     info!("WhatsApp backend run loop started");
 
     // Run the loop concurrently with a small command listener so the UI can ask
     // for a clean stop when its window closes.
     tokio::select! {
-        res = handle => {
-            if let Err(e) = res {
-                warn!("bot run loop ended: {e:?}");
+        _ = &mut handle => warn!("bot run loop ended"),
+        cmd = command_rx.recv() => match cmd {
+            Ok(WaCommand::Shutdown) => {
+                info!("shutdown requested by UI");
+                handle.shutdown().await;
             }
-        }
-        cmd = command_rx.recv() => {
-            match cmd {
-                Ok(WaCommand::Shutdown) => info!("shutdown requested by UI"),
-                Err(_) => info!("command channel closed; stopping backend"),
+            Err(_) => {
+                info!("command channel closed; stopping backend");
+                handle.abort();
             }
-        }
+        },
     }
 
     Ok(())
@@ -155,7 +157,7 @@ async fn handle_event(
         }
         Event::Connected(_) => {
             // `Connected` carries no JID; read our own number from the store.
-            let jid = client.get_pn().await.map(|j| j.to_string());
+            let jid = client.get_pn().map(|j| j.to_string());
             info!("connected (jid={jid:?})");
             let _ = tx
                 .send(WaEvent::Connected {
