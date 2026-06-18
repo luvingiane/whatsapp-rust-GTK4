@@ -2,6 +2,7 @@
 //! Tokio backend, and bridges backend events to the UI on the GTK main loop.
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -85,6 +86,24 @@ fn on_activate(app: &adw::Application) {
         });
     }
 
+    // Avatars: a visible row / group bubble lacking a picture asks the backend to
+    // fetch it. Dedup requests so we hit the channel once per JID.
+    {
+        let requested: Rc<RefCell<HashSet<String>>> = Rc::new(RefCell::new(HashSet::new()));
+        let need = {
+            let command_tx = command_tx.clone();
+            let requested = requested.clone();
+            move |jid: String| {
+                if requested.borrow_mut().insert(jid.clone()) {
+                    let _ = command_tx.try_send(WaCommand::FetchAvatar(jid));
+                }
+            }
+        };
+        let need2 = need.clone();
+        win.chat_list.connect_need_avatar(need);
+        win.thread.connect_need_avatar(need2);
+    }
+
     // Drain backend events on the GTK main loop. `spawn_future_local` guarantees
     // this future runs on the main thread, so it is safe to touch widgets here.
     let win_ev = win.clone();
@@ -149,6 +168,13 @@ fn on_activate(app: &adw::Application) {
                 WaEvent::OlderHistory { jid, messages } => {
                     if current_open_ev.borrow().as_deref() == Some(jid.as_str()) {
                         win_ev.thread.prepend_history(&messages);
+                    }
+                }
+                // A profile picture landed on disk: decode it and update widgets.
+                WaEvent::Avatar { jid, path } => {
+                    if let Ok(tex) = gtk::gdk::Texture::from_filename(&path) {
+                        win_ev.chat_list.set_avatar(&jid, &tex);
+                        win_ev.thread.set_avatar(&jid, &tex);
                     }
                 }
             }

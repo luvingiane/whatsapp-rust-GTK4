@@ -31,8 +31,11 @@ impl MainWindow {
         login_tb.add_top_bar(&adw::HeaderBar::new());
         login_tb.set_content(Some(&login.root));
 
+        // Shared profile-picture cache, used by the sidebar and the thread.
+        let avatars = super::new_avatar_cache();
+
         // --- sidebar (chat list) ----------------------------------------------
-        let chat_list = ChatList::new();
+        let chat_list = ChatList::new(&avatars);
         let sidebar_tb = adw::ToolbarView::new();
         let sidebar_header = adw::HeaderBar::new();
         let sidebar_title = adw::WindowTitle::new("Chat", "");
@@ -47,7 +50,7 @@ impl MainWindow {
             .title("Seleziona una chat")
             .description("Scegli una conversazione dalla lista.")
             .build();
-        let thread = ThreadView::new();
+        let thread = ThreadView::new(&avatars);
         let content_stack = gtk::Stack::new();
         content_stack.add_named(&empty, Some("empty"));
         content_stack.add_named(&thread.root, Some("thread"));

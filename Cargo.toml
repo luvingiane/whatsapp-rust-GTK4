@@ -48,6 +48,12 @@ rusqlite = "=0.39.0"
 # --- QR rendering (we rasterize the module matrix ourselves, no image dep) ---
 qrcode = { version = "0.14", default-features = false }
 
+# --- profile-picture download (blocking GET in spawn_blocking) ---------------
+# whatsapp-rust returns a CDN URL for avatars but does NOT download it, so we
+# fetch the bytes ourselves. ureq 3 (with rustls TLS) is already in the tree via
+# whatsapp-rust-ureq-http-client; reuse it to avoid a second HTTP/TLS stack.
+ureq = "3"
+
 # --- errors + logging -------------------------------------------------------
 anyhow = "1"
 log = "0.4"
