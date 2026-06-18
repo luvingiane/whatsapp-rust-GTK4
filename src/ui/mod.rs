@@ -4,4 +4,5 @@
 pub mod chat_list;
 pub mod chat_object;
 pub mod login;
+pub mod thread;
 pub mod window;

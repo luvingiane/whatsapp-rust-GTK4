@@ -1,21 +1,25 @@
-//! The main application window. Its content is a `gtk::Stack` with two pages:
-//! `login` (QR / connection status) and `main` (the chat split view). The app
-//! switches between them as the backend connects or logs out.
+//! The main application window. Its content is a top-level `gtk::Stack` with two
+//! pages: `login` (QR / connection status) and `main` (the chat split view). The
+//! content side of the split view is itself a stack: an empty placeholder until a
+//! chat is selected, then the conversation [`ThreadView`].
 
 use adw::prelude::*;
 use libadwaita as adw;
 
 use super::chat_list::ChatList;
 use super::login::LoginView;
+use super::thread::ThreadView;
+use crate::model::MessageRow;
 
 #[derive(Clone)]
 pub struct MainWindow {
     pub window: adw::ApplicationWindow,
     pub login: LoginView,
     pub chat_list: ChatList,
+    pub thread: ThreadView,
     stack: gtk::Stack,
     content_page: adw::NavigationPage,
-    content_status: adw::StatusPage,
+    content_stack: gtk::Stack,
     sidebar_title: adw::WindowTitle,
 }
 
@@ -37,15 +41,21 @@ impl MainWindow {
         sidebar_tb.set_content(Some(&chat_list.root));
         let sidebar_page = adw::NavigationPage::new(&sidebar_tb, "Chat");
 
-        // --- content (placeholder until Step 3) -------------------------------
-        let content_status = adw::StatusPage::builder()
+        // --- content: empty placeholder + conversation thread -----------------
+        let empty = adw::StatusPage::builder()
             .icon_name("dialog-information-symbolic")
             .title("Seleziona una chat")
-            .description("La conversazione completa arriverà nel prossimo modulo.")
+            .description("Scegli una conversazione dalla lista.")
             .build();
+        let thread = ThreadView::new();
+        let content_stack = gtk::Stack::new();
+        content_stack.add_named(&empty, Some("empty"));
+        content_stack.add_named(&thread.root, Some("thread"));
+        content_stack.set_visible_child_name("empty");
+
         let content_tb = adw::ToolbarView::new();
         content_tb.add_top_bar(&adw::HeaderBar::new());
-        content_tb.set_content(Some(&content_status));
+        content_tb.set_content(Some(&content_stack));
         let content_page = adw::NavigationPage::new(&content_tb, "WhatsApp");
 
         let split = adw::NavigationSplitView::builder()
@@ -53,7 +63,7 @@ impl MainWindow {
             .content(&content_page)
             .build();
 
-        // --- stack -------------------------------------------------------------
+        // --- top-level stack ---------------------------------------------------
         let stack = gtk::Stack::new();
         stack.add_named(&login_tb, Some("login"));
         stack.add_named(&split, Some("main"));
@@ -69,27 +79,14 @@ impl MainWindow {
             .content(&stack)
             .build();
 
-        // Selecting a chat updates the placeholder (real thread view is Step 3).
-        {
-            let content_page = content_page.clone();
-            let content_status = content_status.clone();
-            chat_list.connect_open(move |jid, name| {
-                content_page.set_title(&name);
-                content_status.set_icon_name(Some("user-available-symbolic"));
-                content_status.set_title(&name);
-                content_status.set_description(Some(&format!(
-                    "{jid}\nLa conversazione arriverà nello Step 3."
-                )));
-            });
-        }
-
         Self {
             window,
             login,
             chat_list,
+            thread,
             stack,
             content_page,
-            content_status,
+            content_stack,
             sidebar_title,
         }
     }
@@ -109,14 +106,28 @@ impl MainWindow {
         self.stack.set_visible_child_name("main");
     }
 
-    /// Reset the content placeholder (e.g. on logout).
+    /// Open a chat in the content pane: set the title and switch to the (empty,
+    /// loading) thread view. History arrives later via [`Self::show_history`].
+    pub fn open_chat(&self, jid: &str, name: &str) {
+        self.content_page.set_title(name);
+        self.thread.set_loading(jid.ends_with("@g.us"));
+        self.content_stack.set_visible_child_name("thread");
+    }
+
+    /// Render the loaded history for the open chat.
+    pub fn show_history(&self, messages: &[MessageRow]) {
+        self.thread.show_history(messages);
+    }
+
+    /// Append a live message to the open thread.
+    pub fn append_message(&self, m: &MessageRow) {
+        self.thread.append(m);
+    }
+
+    /// Reset the content pane to the empty placeholder (e.g. on logout).
     pub fn reset_content(&self) {
         self.content_page.set_title("WhatsApp");
-        self.content_status
-            .set_icon_name(Some("dialog-information-symbolic"));
-        self.content_status.set_title("Seleziona una chat");
-        self.content_status.set_description(Some(
-            "La conversazione completa arriverà nel prossimo modulo.",
-        ));
+        self.thread.clear();
+        self.content_stack.set_visible_child_name("empty");
     }
 }
