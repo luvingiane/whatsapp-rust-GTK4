@@ -1,6 +1,9 @@
 //! The chat list sidebar: a virtualized `ListView` over a `ListStore` of
 //! [`ChatObject`]s, rebuilt from a [`ChatSummary`] snapshot on each update.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use adw::prelude::*;
 use gtk::{gio, glib};
 use libadwaita as adw;
@@ -10,7 +13,7 @@ use crate::model::ChatSummary;
 
 #[derive(Clone)]
 pub struct ChatList {
-    pub root: gtk::ScrolledWindow,
+    pub root: gtk::Box,
     store: gio::ListStore,
     list_view: gtk::ListView,
 }
@@ -18,8 +21,24 @@ pub struct ChatList {
 impl ChatList {
     pub fn new() -> Self {
         let store = gio::ListStore::new::<ChatObject>();
+
+        // Live name/number filter driven by the search entry below.
+        let query: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+        let filter = {
+            let query = query.clone();
+            gtk::CustomFilter::new(move |obj| {
+                let q = query.borrow();
+                if q.is_empty() {
+                    return true;
+                }
+                obj.downcast_ref::<ChatObject>().is_some_and(|c| {
+                    c.name().to_lowercase().contains(q.as_str()) || c.jid().contains(q.as_str())
+                })
+            })
+        };
+        let filter_model = gtk::FilterListModel::new(Some(store.clone()), Some(filter.clone()));
         let selection = gtk::SingleSelection::builder()
-            .model(&store)
+            .model(&filter_model)
             .autoselect(false)
             .can_unselect(true)
             .build();
@@ -50,11 +69,28 @@ impl ChatList {
             .build();
         list_view.add_css_class("navigation-sidebar");
 
-        let root = gtk::ScrolledWindow::builder()
+        let scrolled = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
             .vexpand(true)
             .child(&list_view)
             .build();
+
+        // Search bar above the list: filters chats by name or number.
+        let search = gtk::SearchEntry::builder()
+            .placeholder_text("Cerca chat")
+            .margin_top(6)
+            .margin_bottom(6)
+            .margin_start(6)
+            .margin_end(6)
+            .build();
+        search.connect_search_changed(move |entry| {
+            *query.borrow_mut() = entry.text().to_lowercase();
+            filter.changed(gtk::FilterChange::Different);
+        });
+
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        root.append(&search);
+        root.append(&scrolled);
 
         Self {
             root,

@@ -13,6 +13,9 @@ use rusqlite::{params, Connection};
 use crate::model::{ChatSummary, MessageRow};
 use crate::util::preview;
 
+/// A `chat_meta` row: (jid, archived, pinned, muted_until, saved_name).
+type ChatMetaRow = (String, bool, bool, i64, String);
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS chats (
   jid          TEXT PRIMARY KEY,
@@ -393,6 +396,31 @@ impl Store {
                         ts: r.get(4)?,
                         body: r.get(5)?,
                     })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await?
+    }
+
+    /// Returns every `chat_meta` row as (jid, archived, pinned, muted_until,
+    /// saved_name). Used by the LID↔PN reconcile to re-key entries under both
+    /// the phone-number and LID forms.
+    pub async fn all_chat_meta(&self) -> Result<Vec<ChatMetaRow>> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<ChatMetaRow>> {
+            let guard = conn.lock().map_err(|_| anyhow!("store mutex poisoned"))?;
+            let mut stmt = guard
+                .prepare("SELECT jid,archived,pinned,muted_until,saved_name FROM chat_meta")?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)? != 0,
+                        r.get::<_, i64>(2)? != 0,
+                        r.get::<_, i64>(3)?,
+                        r.get::<_, String>(4)?,
+                    ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
