@@ -1,8 +1,9 @@
 //! The conversation thread view: a scrolled column of message bubbles (sent on
-//! the right, received on the left). Populated from a [`MessageRow`] history and
-//! appended in real time. Media show as a labelled placeholder for now.
+//! the right, received on the left). Populated from a [`MessageRow`] history,
+//! appended in real time, and backfilled with older pages when scrolled to the
+//! top. Media show as a labelled placeholder for now.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gtk::glib;
@@ -11,12 +12,26 @@ use gtk::prelude::*;
 use crate::model::MessageRow;
 use crate::util::preview;
 
+/// Scroll position (px from top) under which we ask for the previous page.
+const BACKFILL_THRESHOLD: f64 = 40.0;
+
+type LoadOlderCb = Box<dyn Fn(i64, String)>;
+
 #[derive(Clone)]
 pub struct ThreadView {
     pub root: gtk::ScrolledWindow,
     list: gtk::Box,
     /// Whether the open chat is a group (drives the per-message sender label).
     is_group: Rc<Cell<bool>>,
+    /// Keyset cursor (ts, id) of the topmost loaded message, or `None` until a
+    /// history is shown. Drives backfill requests.
+    oldest: Rc<RefCell<Option<(i64, String)>>>,
+    /// A backfill request is in flight (suppresses duplicate requests).
+    loading_older: Rc<Cell<bool>>,
+    /// Local history exhausted: stop asking for older pages.
+    exhausted: Rc<Cell<bool>>,
+    /// Called with the current `(ts, id)` cursor when the user scrolls to the top.
+    on_load_older: Rc<RefCell<Option<LoadOlderCb>>>,
 }
 
 impl ThreadView {
@@ -36,10 +51,38 @@ impl ThreadView {
             .child(&list)
             .build();
 
+        let oldest: Rc<RefCell<Option<(i64, String)>>> = Rc::new(RefCell::new(None));
+        let loading_older = Rc::new(Cell::new(false));
+        let exhausted = Rc::new(Cell::new(false));
+        let on_load_older: Rc<RefCell<Option<LoadOlderCb>>> = Rc::new(RefCell::new(None));
+
+        // Backfill trigger: when scrolled near the top, ask for the previous page.
+        {
+            let oldest = oldest.clone();
+            let loading_older = loading_older.clone();
+            let exhausted = exhausted.clone();
+            let on_load_older = on_load_older.clone();
+            root.vadjustment().connect_value_changed(move |adj| {
+                if adj.value() > BACKFILL_THRESHOLD || loading_older.get() || exhausted.get() {
+                    return;
+                }
+                let cursor = oldest.borrow().clone();
+                let Some((ts, id)) = cursor else { return };
+                if let Some(cb) = on_load_older.borrow().as_ref() {
+                    loading_older.set(true);
+                    cb(ts, id);
+                }
+            });
+        }
+
         Self {
             root,
             list,
             is_group: Rc::new(Cell::new(false)),
+            oldest,
+            loading_older,
+            exhausted,
+            on_load_older,
         }
     }
 
@@ -55,7 +98,39 @@ impl ThreadView {
         for m in messages {
             self.list.append(&self.bubble(m));
         }
+        // First message is the oldest → the backfill cursor starts there.
+        *self.oldest.borrow_mut() = messages.first().map(|m| (m.ts, m.id.clone()));
+        self.loading_older.set(false);
+        self.exhausted.set(false);
         self.scroll_to_bottom();
+    }
+
+    /// Prepend an older page (oldest-first) while keeping the viewport on the same
+    /// message. An empty page means the local history is exhausted.
+    pub fn prepend_history(&self, messages: &[MessageRow]) {
+        if messages.is_empty() {
+            self.exhausted.set(true);
+            self.loading_older.set(false);
+            return;
+        }
+
+        // Record the scroll geometry before inserting, so we can compensate for
+        // the height added above the current viewport.
+        let vadj = self.root.vadjustment();
+        let old_value = vadj.value();
+        let old_upper = vadj.upper();
+
+        // Prepend in reverse so the final order stays oldest-first at the top.
+        for m in messages.iter().rev() {
+            self.list.prepend(&self.bubble(m));
+        }
+        *self.oldest.borrow_mut() = messages.first().map(|m| (m.ts, m.id.clone()));
+
+        // Restore the viewport after layout recomputes `upper`.
+        glib::idle_add_local_once(move || {
+            vadj.set_value(old_value + (vadj.upper() - old_upper));
+        });
+        self.loading_older.set(false);
     }
 
     /// Append a single live message and scroll to the bottom.
@@ -64,11 +139,20 @@ impl ThreadView {
         self.scroll_to_bottom();
     }
 
-    /// Remove all bubbles.
+    /// Registers the callback invoked (with the current `(ts, id)` cursor) when the
+    /// user scrolls to the top and an older page should be loaded.
+    pub fn connect_load_older<F: Fn(i64, String) + 'static>(&self, f: F) {
+        *self.on_load_older.borrow_mut() = Some(Box::new(f));
+    }
+
+    /// Remove all bubbles and reset the backfill state.
     pub fn clear(&self) {
         while let Some(child) = self.list.first_child() {
             self.list.remove(&child);
         }
+        *self.oldest.borrow_mut() = None;
+        self.loading_older.set(false);
+        self.exhausted.set(false);
     }
 
     fn bubble(&self, m: &MessageRow) -> gtk::Box {

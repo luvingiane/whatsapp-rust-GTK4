@@ -68,6 +68,23 @@ fn on_activate(app: &adw::Application) {
         });
     }
 
+    // Scrolled to the top of the open thread: ask for the previous page of the
+    // currently open chat (backed by app.db; no network).
+    {
+        let command_tx = command_tx.clone();
+        let current_open = current_open.clone();
+        win.thread.connect_load_older(move |before_ts, before_id| {
+            if let Some(jid) = current_open.borrow().clone() {
+                let _ = command_tx.try_send(WaCommand::LoadOlder {
+                    jid,
+                    before_ts,
+                    before_id,
+                    count: 200,
+                });
+            }
+        });
+    }
+
     // Drain backend events on the GTK main loop. `spawn_future_local` guarantees
     // this future runs on the main thread, so it is safe to touch widgets here.
     let win_ev = win.clone();
@@ -126,6 +143,12 @@ fn on_activate(app: &adw::Application) {
                 WaEvent::NewMessage(row) => {
                     if current_open_ev.borrow().as_deref() == Some(row.chat_jid.as_str()) {
                         win_ev.append_message(&row);
+                    }
+                }
+                // An older page for the open chat: prepend, preserving scroll.
+                WaEvent::OlderHistory { jid, messages } => {
+                    if current_open_ev.borrow().as_deref() == Some(jid.as_str()) {
+                        win_ev.thread.prepend_history(&messages);
                     }
                 }
             }

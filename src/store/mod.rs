@@ -371,22 +371,70 @@ impl Store {
         tokio::task::spawn_blocking(move || -> Result<Vec<MessageRow>> {
             let guard = conn.lock().map_err(|_| anyhow!("store mutex poisoned"))?;
             // Resolve the sender's display name (saved name → pushname) for group
-            // author labels; empty → the UI falls back to the number.
+            // author labels; empty → the UI falls back to the number. Order by
+            // (ts,id) — the same key the backfill cursor pages on (load_messages_before).
             let mut stmt = guard.prepare(
                 "SELECT x.id, x.sender_jid,
                         COALESCE(NULLIF(cm.saved_name,''), NULLIF(ct.name,''), '') AS sender_name,
                         x.from_me, x.ts, x.body
                  FROM (
-                   SELECT rowid AS rid, id, sender_jid, from_me, ts, body
+                   SELECT id, sender_jid, from_me, ts, body
                    FROM messages WHERE chat_jid=?1
-                   ORDER BY ts DESC, rid DESC LIMIT ?2
+                   ORDER BY ts DESC, id DESC LIMIT ?2
                  ) x
                  LEFT JOIN chat_meta cm ON cm.jid = x.sender_jid
                  LEFT JOIN contacts  ct ON ct.jid = x.sender_jid
-                 ORDER BY x.ts ASC, x.rid ASC",
+                 ORDER BY x.ts ASC, x.id ASC",
             )?;
             let rows = stmt
                 .query_map(params![chat_jid, limit], |r| {
+                    Ok(MessageRow {
+                        id: r.get(0)?,
+                        chat_jid: chat_jid.clone(),
+                        sender_jid: r.get(1)?,
+                        sender_name: r.get(2)?,
+                        from_me: r.get::<_, i64>(3)? != 0,
+                        ts: r.get(4)?,
+                        body: r.get(5)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await?
+    }
+
+    /// Loads the page of `limit` messages immediately older than the keyset cursor
+    /// `(before_ts, before_id)`, returned oldest-first. Used for scroll-up backfill;
+    /// an empty result means the local history has been exhausted.
+    pub async fn load_messages_before(
+        &self,
+        chat_jid: String,
+        before_ts: i64,
+        before_id: String,
+        limit: i64,
+    ) -> Result<Vec<MessageRow>> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<MessageRow>> {
+            let guard = conn.lock().map_err(|_| anyhow!("store mutex poisoned"))?;
+            // Keyset pagination on (ts,id): strictly older than the cursor, matching
+            // the (ts DESC, id DESC) ordering used by load_messages.
+            let mut stmt = guard.prepare(
+                "SELECT x.id, x.sender_jid,
+                        COALESCE(NULLIF(cm.saved_name,''), NULLIF(ct.name,''), '') AS sender_name,
+                        x.from_me, x.ts, x.body
+                 FROM (
+                   SELECT id, sender_jid, from_me, ts, body
+                   FROM messages
+                   WHERE chat_jid=?1 AND (ts < ?2 OR (ts = ?2 AND id < ?3))
+                   ORDER BY ts DESC, id DESC LIMIT ?4
+                 ) x
+                 LEFT JOIN chat_meta cm ON cm.jid = x.sender_jid
+                 LEFT JOIN contacts  ct ON ct.jid = x.sender_jid
+                 ORDER BY x.ts ASC, x.id ASC",
+            )?;
+            let rows = stmt
+                .query_map(params![chat_jid, before_ts, before_id, limit], |r| {
                     Ok(MessageRow {
                         id: r.get(0)?,
                         chat_jid: chat_jid.clone(),
