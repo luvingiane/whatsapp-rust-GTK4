@@ -168,6 +168,19 @@ pub async fn run(
                         Err(e) => warn!("load_messages failed: {e:?}"),
                     }
                 }
+                Ok(WaCommand::LoadOlder { jid, before_ts, before_id, count }) => {
+                    // Local-only backfill: page back through what history sync
+                    // already stored in app.db (no network request).
+                    match store
+                        .load_messages_before(jid.clone(), before_ts, before_id, count)
+                        .await
+                    {
+                        Ok(messages) => {
+                            let _ = event_tx.send(WaEvent::OlderHistory { jid, messages }).await;
+                        }
+                        Err(e) => warn!("load_messages_before failed: {e:?}"),
+                    }
+                }
                 Ok(WaCommand::Shutdown) => {
                     info!("shutdown requested by UI");
                     handle.shutdown().await;

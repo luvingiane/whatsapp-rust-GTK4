@@ -40,6 +40,13 @@ pub enum WaEvent {
     /// A single new/live message persisted to the store. The UI appends it if the
     /// matching chat is currently open.
     NewMessage(MessageRow),
+    /// An older page of history for a chat, requested via [`WaCommand::LoadOlder`],
+    /// oldest-first. The UI prepends it (preserving scroll); an empty `messages`
+    /// means the local history has been exhausted.
+    OlderHistory {
+        jid: String,
+        messages: Vec<MessageRow>,
+    },
 }
 
 /// Commands flowing **from** the GTK UI **to** the WhatsApp backend.
@@ -52,6 +59,14 @@ pub enum WaCommand {
     /// Load a chat's message history; the backend replies with
     /// [`WaEvent::ChatHistory`].
     OpenChat(String),
+    /// Load the page of messages older than the keyset cursor `(before_ts,
+    /// before_id)` for `jid`; the backend replies with [`WaEvent::OlderHistory`].
+    LoadOlder {
+        jid: String,
+        before_ts: i64,
+        before_id: String,
+        count: i64,
+    },
     /// Ask the backend to stop its run loop (sent when the window closes).
     Shutdown,
 }
