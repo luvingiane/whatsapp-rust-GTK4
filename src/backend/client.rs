@@ -22,6 +22,7 @@ use whatsapp_rust_ureq_http_client::UreqHttpClient;
 
 use super::bridge::{WaCommand, WaEvent};
 use crate::config;
+use crate::model::MessageRow;
 use crate::store::{ChatUpsert, Store};
 use crate::util::preview;
 
@@ -108,20 +109,34 @@ pub async fn run(
     let mut handle = bot.spawn();
     info!("WhatsApp backend run loop started");
 
-    // Run the loop concurrently with a small command listener so the UI can ask
-    // for a clean stop when its window closes.
-    tokio::select! {
-        _ = &mut handle => warn!("bot run loop ended"),
-        cmd = command_rx.recv() => match cmd {
-            Ok(WaCommand::Shutdown) => {
-                info!("shutdown requested by UI");
-                handle.shutdown().await;
+    // Serve UI commands until the window closes (Shutdown) or the run loop ends.
+    loop {
+        tokio::select! {
+            _ = &mut handle => {
+                warn!("bot run loop ended");
+                break;
             }
-            Err(_) => {
-                info!("command channel closed; stopping backend");
-                handle.abort();
-            }
-        },
+            cmd = command_rx.recv() => match cmd {
+                Ok(WaCommand::OpenChat(jid)) => {
+                    match store.load_messages(jid.clone(), 200).await {
+                        Ok(messages) => {
+                            let _ = event_tx.send(WaEvent::ChatHistory { jid, messages }).await;
+                        }
+                        Err(e) => warn!("load_messages failed: {e:?}"),
+                    }
+                }
+                Ok(WaCommand::Shutdown) => {
+                    info!("shutdown requested by UI");
+                    handle.shutdown().await;
+                    break;
+                }
+                Err(_) => {
+                    info!("command channel closed; stopping backend");
+                    handle.abort();
+                    break;
+                }
+            },
+        }
     }
 
     Ok(())
@@ -227,6 +242,16 @@ async fn handle_event(
                         warn!("upsert_chats failed: {e:?}");
                     }
                 }
+
+                // Persist every message for the conversation view.
+                let msgs: Vec<MessageRow> =
+                    hs.conversations.iter().flat_map(conv_to_messages).collect();
+                if !msgs.is_empty() {
+                    info!("history sync: storing {} messages", msgs.len());
+                    if let Err(e) = store.insert_messages(msgs).await {
+                        warn!("insert_messages failed: {e:?}");
+                    }
+                }
                 dirty.notify_one();
             }
         }
@@ -244,15 +269,39 @@ async fn handle_event(
                     }
                 }
 
-                let text = preview::message_preview(msg);
-                let ts = info.timestamp.timestamp();
-                if let Err(e) = store
-                    .apply_message(chat, text, ts, info.source.is_from_me)
-                    .await
-                {
-                    warn!("apply_message failed: {e:?}");
+                let body = preview::message_preview(msg);
+                // Skip system/protocol messages (empty preview): no bubble, no
+                // chat-list preview change.
+                if !body.is_empty() {
+                    let ts = info.timestamp.timestamp();
+                    let from_me = info.source.is_from_me;
+                    if let Err(e) = store
+                        .apply_message(chat.clone(), body.clone(), ts, from_me)
+                        .await
+                    {
+                        warn!("apply_message failed: {e:?}");
+                    }
+                    let row = MessageRow {
+                        id: info.id.clone(),
+                        chat_jid: chat,
+                        sender_jid: info.source.sender.to_string(),
+                        // Sender's profile name straight from the event (group labels);
+                        // empty for our own messages.
+                        sender_name: if from_me {
+                            String::new()
+                        } else {
+                            info.push_name.clone()
+                        },
+                        from_me,
+                        ts,
+                        body,
+                    };
+                    if let Err(e) = store.insert_message(row.clone()).await {
+                        warn!("insert_message failed: {e:?}");
+                    }
+                    let _ = tx.send(WaEvent::NewMessage(row)).await;
+                    dirty.notify_one();
                 }
-                dirty.notify_one();
             }
         }
         // App-state full-sync (and live) updates: archive/pin/mute + the saved
@@ -283,7 +332,6 @@ async fn handle_event(
             dirty.notify_one();
         }
         Event::ContactUpdate(c) => {
-            let jid = normalize_chat_jid(&client, &c.jid).await;
             let name = c
                 .action
                 .full_name
@@ -292,8 +340,22 @@ async fn handle_event(
                 .or_else(|| c.action.first_name.clone())
                 .unwrap_or_default();
             if !name.is_empty() {
-                if let Err(e) = store.set_saved_name(jid, name).await {
-                    warn!("set_saved_name failed: {e:?}");
+                // Store the saved name under EVERY known key for this contact —
+                // phone-number JID, LID JID, and the raw event JID — so it resolves
+                // whether a chat (1:1, keyed PN) or a group sender (keyed LID) looks
+                // it up. ContactAction carries both pn_jid and lid_jid.
+                let keys = [
+                    c.action.pn_jid.clone(),
+                    c.action.lid_jid.clone(),
+                    Some(c.jid.to_string()),
+                ];
+                for key in keys.into_iter().flatten() {
+                    if key.is_empty() {
+                        continue;
+                    }
+                    if let Err(e) = store.set_saved_name(key, name.clone()).await {
+                        warn!("set_saved_name failed: {e:?}");
+                    }
                 }
                 dirty.notify_one();
             }
@@ -358,6 +420,39 @@ fn conv_to_upsert(c: &wa::Conversation) -> Option<ChatUpsert> {
         pinned: c.pinned.unwrap_or(0) > 0,
         muted_until: c.mute_end_time.unwrap_or(0) as i64,
     })
+}
+
+/// Extracts all displayable messages of a conversation into owned [`MessageRow`]s
+/// for the message store. System/protocol/empty messages are skipped.
+fn conv_to_messages(c: &wa::Conversation) -> Vec<MessageRow> {
+    let chat = c.id.clone();
+    if !is_user_chat(&chat) {
+        return Vec::new();
+    }
+    c.messages
+        .iter()
+        .filter_map(|hm| {
+            let wmi = hm.message.as_ref()?;
+            let msg = wmi.message.as_ref()?;
+            let body = preview::message_preview(msg);
+            if body.is_empty() {
+                return None;
+            }
+            let id = wmi.key.id.clone()?;
+            // Group sender is in key.participant; for 1:1 use the chat jid.
+            let sender_jid = wmi.key.participant.clone().unwrap_or_else(|| chat.clone());
+            Some(MessageRow {
+                id,
+                chat_jid: chat.clone(),
+                sender_jid,
+                // Resolved at read time (store::load_messages JOIN).
+                sender_name: String::new(),
+                from_me: wmi.key.from_me.unwrap_or(false),
+                ts: wmi.message_timestamp.unwrap_or(0) as i64,
+                body,
+            })
+        })
+        .collect()
 }
 
 /// Finds the most recent message **with displayable content** and returns its

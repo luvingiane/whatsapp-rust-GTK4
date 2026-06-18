@@ -1,6 +1,9 @@
 //! Wires everything together: creates the libadwaita application, spawns the
 //! Tokio backend, and bridges backend events to the UI on the GTK main loop.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use adw::prelude::*;
 use gtk::glib;
 use libadwaita as adw;
@@ -49,10 +52,27 @@ fn on_activate(app: &adw::Application) {
         chans.command_rx.clone(),
     );
 
+    // Tracks which chat is currently open, so history/live messages target it.
+    let current_open: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    let command_tx = chans.command_tx.clone();
+
+    // Selecting a chat: switch the content pane and ask the backend for history.
+    {
+        let win_sel = win.clone();
+        let command_tx = command_tx.clone();
+        let current_open = current_open.clone();
+        win.chat_list.connect_open(move |jid, name| {
+            *current_open.borrow_mut() = Some(jid.clone());
+            win_sel.open_chat(&jid, &name);
+            let _ = command_tx.try_send(WaCommand::OpenChat(jid));
+        });
+    }
+
     // Drain backend events on the GTK main loop. `spawn_future_local` guarantees
     // this future runs on the main thread, so it is safe to touch widgets here.
     let win_ev = win.clone();
     let event_rx = chans.event_rx.clone();
+    let current_open_ev = current_open.clone();
     glib::spawn_future_local(async move {
         while let Ok(ev) = event_rx.recv().await {
             match ev {
@@ -80,6 +100,7 @@ fn on_activate(app: &adw::Application) {
                 // Transient drop: whatsapp-rust reconnects on its own; stay put.
                 WaEvent::Disconnected => {}
                 WaEvent::LoggedOut => {
+                    *current_open_ev.borrow_mut() = None;
                     win_ev.chat_list.update(&[]);
                     win_ev.reset_content();
                     win_ev.login.show_waiting();
@@ -96,12 +117,22 @@ fn on_activate(app: &adw::Application) {
                     }
                     win_ev.chat_list.update(&chats);
                 }
+                // History/live messages: apply only if their chat is still open.
+                WaEvent::ChatHistory { jid, messages } => {
+                    if current_open_ev.borrow().as_deref() == Some(jid.as_str()) {
+                        win_ev.show_history(&messages);
+                    }
+                }
+                WaEvent::NewMessage(row) => {
+                    if current_open_ev.borrow().as_deref() == Some(row.chat_jid.as_str()) {
+                        win_ev.append_message(&row);
+                    }
+                }
             }
         }
     });
 
     // Ask the backend to stop cleanly when the window is closed.
-    let command_tx = chans.command_tx.clone();
     win.window.connect_close_request(move |_| {
         let _ = command_tx.try_send(WaCommand::Shutdown);
         glib::Propagation::Proceed
@@ -127,7 +158,14 @@ fn load_css() {
             padding: 0px 7px; \
             font-size: 0.8em; \
             font-weight: bold; \
-         }",
+         } \
+         .bubble-in, .bubble-out { \
+            border-radius: 12px; \
+            padding: 6px 10px; \
+            margin: 1px 0px; \
+         } \
+         .bubble-in { background-color: alpha(currentColor, 0.08); } \
+         .bubble-out { background-color: alpha(@accent_bg_color, 0.85); color: @accent_fg_color; }",
     );
     if let Some(display) = gtk::gdk::Display::default() {
         gtk::style_context_add_provider_for_display(

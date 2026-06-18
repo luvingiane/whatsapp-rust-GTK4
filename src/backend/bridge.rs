@@ -9,7 +9,7 @@
 
 use async_channel::{Receiver, Sender};
 
-use crate::model::ChatSummary;
+use crate::model::{ChatSummary, MessageRow};
 
 /// Events flowing **from** the WhatsApp backend (Tokio thread) **to** the GTK UI.
 #[derive(Debug, Clone)]
@@ -31,6 +31,15 @@ pub enum WaEvent {
     /// The full, ordered chat list (sidebar). Sent after history sync and,
     /// debounced, whenever the store changes.
     ChatsSnapshot(Vec<ChatSummary>),
+    /// The message history for a chat the UI requested via [`WaCommand::OpenChat`],
+    /// oldest-first.
+    ChatHistory {
+        jid: String,
+        messages: Vec<MessageRow>,
+    },
+    /// A single new/live message persisted to the store. The UI appends it if the
+    /// matching chat is currently open.
+    NewMessage(MessageRow),
 }
 
 /// Commands flowing **from** the GTK UI **to** the WhatsApp backend.
@@ -40,6 +49,9 @@ pub enum WaEvent {
 /// modules only need to add variants and a match arm.
 #[derive(Debug, Clone)]
 pub enum WaCommand {
+    /// Load a chat's message history; the backend replies with
+    /// [`WaEvent::ChatHistory`].
+    OpenChat(String),
     /// Ask the backend to stop its run loop (sent when the window closes).
     Shutdown,
 }

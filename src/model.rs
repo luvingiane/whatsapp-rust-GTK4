@@ -21,3 +21,24 @@ pub struct ChatSummary {
     /// Whether the chat is pinned (sorted above the rest).
     pub pinned: bool,
 }
+
+/// A single message in a conversation, as shown in the thread view. Produced by
+/// the [`crate::store`] and sent to the UI over the bridge.
+#[derive(Debug, Clone)]
+pub struct MessageRow {
+    /// WhatsApp message id (unique within a chat).
+    pub id: String,
+    /// The chat this message belongs to.
+    pub chat_jid: String,
+    /// Sender JID (used to label the author in group chats).
+    pub sender_jid: String,
+    /// Resolved sender display name (saved name / pushname); empty if unknown,
+    /// in which case the UI falls back to the number.
+    pub sender_name: String,
+    /// Whether we sent this message.
+    pub from_me: bool,
+    /// Unix timestamp (seconds).
+    pub ts: i64,
+    /// Display text: the message text, or a media placeholder ("📷 Foto", …).
+    pub body: String,
+}

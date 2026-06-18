@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, Result};
 use rusqlite::{params, Connection};
 
-use crate::model::ChatSummary;
+use crate::model::{ChatSummary, MessageRow};
 use crate::util::preview;
 
 const SCHEMA: &str = "
@@ -40,6 +40,18 @@ CREATE TABLE IF NOT EXISTS chat_meta (
   muted_until INTEGER NOT NULL DEFAULT 0,
   saved_name  TEXT NOT NULL DEFAULT ''
 );
+-- Per-chat message history for the conversation view. (chat_jid,id) is unique so
+-- repeated history syncs / reconnects don't duplicate rows.
+CREATE TABLE IF NOT EXISTS messages (
+  chat_jid   TEXT NOT NULL,
+  id         TEXT NOT NULL,
+  sender_jid TEXT NOT NULL DEFAULT '',
+  from_me    INTEGER NOT NULL DEFAULT 0,
+  ts         INTEGER NOT NULL DEFAULT 0,
+  body       TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (chat_jid, id)
+);
+CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages(chat_jid, ts);
 ";
 
 /// An owned chat row to upsert. We extract these from the (borrowed) protobuf on
@@ -287,6 +299,99 @@ impl Store {
                         unread: r.get::<_, i64>(5)? as u32,
                         is_group: r.get::<_, i64>(6)? != 0,
                         pinned: r.get::<_, i64>(7)? != 0,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await?
+    }
+
+    /// Bulk-inserts messages (from a history sync). Existing (chat_jid,id) rows
+    /// are kept, so repeated syncs don't duplicate.
+    pub async fn insert_messages(&self, rows: Vec<MessageRow>) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut guard = conn.lock().map_err(|_| anyhow!("store mutex poisoned"))?;
+            let tx = guard.transaction()?;
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT OR IGNORE INTO messages
+                       (chat_jid,id,sender_jid,from_me,ts,body)
+                     VALUES (?1,?2,?3,?4,?5,?6)",
+                )?;
+                for m in &rows {
+                    stmt.execute(params![
+                        m.chat_jid,
+                        m.id,
+                        m.sender_jid,
+                        m.from_me as i64,
+                        m.ts,
+                        m.body
+                    ])?;
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await?
+    }
+
+    /// Inserts a single live message (idempotent on `(chat_jid,id)`).
+    pub async fn insert_message(&self, m: MessageRow) -> Result<()> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let guard = conn.lock().map_err(|_| anyhow!("store mutex poisoned"))?;
+            guard.execute(
+                "INSERT OR IGNORE INTO messages (chat_jid,id,sender_jid,from_me,ts,body)
+                 VALUES (?1,?2,?3,?4,?5,?6)",
+                params![
+                    m.chat_jid,
+                    m.id,
+                    m.sender_jid,
+                    m.from_me as i64,
+                    m.ts,
+                    m.body
+                ],
+            )?;
+            Ok(())
+        })
+        .await?
+    }
+
+    /// Loads the most recent `limit` messages of a chat, returned oldest-first.
+    pub async fn load_messages(&self, chat_jid: String, limit: i64) -> Result<Vec<MessageRow>> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<MessageRow>> {
+            let guard = conn.lock().map_err(|_| anyhow!("store mutex poisoned"))?;
+            // Resolve the sender's display name (saved name → pushname) for group
+            // author labels; empty → the UI falls back to the number.
+            let mut stmt = guard.prepare(
+                "SELECT x.id, x.sender_jid,
+                        COALESCE(NULLIF(cm.saved_name,''), NULLIF(ct.name,''), '') AS sender_name,
+                        x.from_me, x.ts, x.body
+                 FROM (
+                   SELECT rowid AS rid, id, sender_jid, from_me, ts, body
+                   FROM messages WHERE chat_jid=?1
+                   ORDER BY ts DESC, rid DESC LIMIT ?2
+                 ) x
+                 LEFT JOIN chat_meta cm ON cm.jid = x.sender_jid
+                 LEFT JOIN contacts  ct ON ct.jid = x.sender_jid
+                 ORDER BY x.ts ASC, x.rid ASC",
+            )?;
+            let rows = stmt
+                .query_map(params![chat_jid, limit], |r| {
+                    Ok(MessageRow {
+                        id: r.get(0)?,
+                        chat_jid: chat_jid.clone(),
+                        sender_jid: r.get(1)?,
+                        sender_name: r.get(2)?,
+                        from_me: r.get::<_, i64>(3)? != 0,
+                        ts: r.get(4)?,
+                        body: r.get(5)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
