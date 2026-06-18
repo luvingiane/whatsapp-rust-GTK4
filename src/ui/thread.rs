@@ -4,11 +4,14 @@
 //! top. Media show as a labelled placeholder for now.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 
+use adw::prelude::*;
 use gtk::glib;
-use gtk::prelude::*;
+use libadwaita as adw;
 
+use super::AvatarCache;
 use crate::model::MessageRow;
 use crate::util::preview;
 
@@ -16,6 +19,7 @@ use crate::util::preview;
 const BACKFILL_THRESHOLD: f64 = 40.0;
 
 type LoadOlderCb = Box<dyn Fn(i64, String)>;
+type NeedAvatarCb = Rc<RefCell<Option<Box<dyn Fn(String)>>>>;
 
 #[derive(Clone)]
 pub struct ThreadView {
@@ -32,10 +36,17 @@ pub struct ThreadView {
     exhausted: Rc<Cell<bool>>,
     /// Called with the current `(ts, id)` cursor when the user scrolls to the top.
     on_load_older: Rc<RefCell<Option<LoadOlderCb>>>,
+    /// Shared decoded-texture cache (shared with the chat list).
+    avatars: AvatarCache,
+    /// Group sender JID → its on-screen avatar widgets, so a late download
+    /// updates already-rendered bubbles. Cleared when the thread is cleared.
+    senders: Rc<RefCell<HashMap<String, Vec<adw::Avatar>>>>,
+    /// Invoked with a sender JID when a group bubble still lacks its avatar.
+    on_need_avatar: NeedAvatarCb,
 }
 
 impl ThreadView {
-    pub fn new() -> Self {
+    pub fn new(avatars: &AvatarCache) -> Self {
         let list = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(4)
@@ -83,6 +94,9 @@ impl ThreadView {
             loading_older,
             exhausted,
             on_load_older,
+            avatars: avatars.clone(),
+            senders: Rc::new(RefCell::new(HashMap::new())),
+            on_need_avatar: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -145,6 +159,25 @@ impl ThreadView {
         *self.on_load_older.borrow_mut() = Some(Box::new(f));
     }
 
+    /// Registers the callback invoked (with a sender JID) when a group bubble
+    /// needs its avatar fetched.
+    pub fn connect_need_avatar<F: Fn(String) + 'static>(&self, f: F) {
+        *self.on_need_avatar.borrow_mut() = Some(Box::new(f));
+    }
+
+    /// Caches a freshly downloaded texture and applies it to any on-screen group
+    /// bubbles authored by `jid`.
+    pub fn set_avatar(&self, jid: &str, tex: &gtk::gdk::Texture) {
+        self.avatars
+            .borrow_mut()
+            .insert(jid.to_string(), tex.clone());
+        if let Some(list) = self.senders.borrow().get(jid) {
+            for a in list {
+                a.set_custom_image(Some(tex));
+            }
+        }
+    }
+
     /// Remove all bubbles and reset the backfill state.
     pub fn clear(&self) {
         while let Some(child) = self.list.first_child() {
@@ -153,6 +186,7 @@ impl ThreadView {
         *self.oldest.borrow_mut() = None;
         self.loading_older.set(false);
         self.exhausted.set(false);
+        self.senders.borrow_mut().clear();
     }
 
     fn bubble(&self, m: &MessageRow) -> gtk::Box {
@@ -199,6 +233,37 @@ impl ThreadView {
         time.add_css_class("dim-label");
         bubble.append(&time);
 
+        // In groups, show the sender's avatar to the left of incoming bubbles.
+        if self.is_group.get() && !m.from_me && !m.sender_jid.is_empty() {
+            let initials = if m.sender_name.is_empty() {
+                preview::pretty_number(&m.sender_jid)
+            } else {
+                m.sender_name.clone()
+            };
+            let avatar = adw::Avatar::new(28, Some(&initials), true);
+            avatar.set_valign(gtk::Align::Start);
+            if let Some(tex) = self.avatars.borrow().get(&m.sender_jid) {
+                avatar.set_custom_image(Some(tex));
+            } else {
+                self.senders
+                    .borrow_mut()
+                    .entry(m.sender_jid.clone())
+                    .or_default()
+                    .push(avatar.clone());
+                if let Some(cb) = self.on_need_avatar.borrow().as_ref() {
+                    cb(m.sender_jid.clone());
+                }
+            }
+            let wrap = gtk::Box::builder()
+                .orientation(gtk::Orientation::Horizontal)
+                .spacing(6)
+                .halign(gtk::Align::Start)
+                .build();
+            wrap.append(&avatar);
+            wrap.append(&bubble);
+            return wrap;
+        }
+
         bubble
     }
 
@@ -208,12 +273,6 @@ impl ThreadView {
         glib::idle_add_local_once(move || {
             vadj.set_value(vadj.upper() - vadj.page_size());
         });
-    }
-}
-
-impl Default for ThreadView {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

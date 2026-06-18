@@ -53,3 +53,24 @@ fn data_file(file: &str) -> anyhow::Result<PathBuf> {
     dir.push(file);
     Ok(dir)
 }
+
+/// Returns the cache path for a contact/group avatar, creating the avatars cache
+/// directory. On Linux this resolves to
+/// `~/.cache/whatsapp-rust-gtk4/avatars/<sanitized-jid>.jpg`. Profile pictures
+/// are downloaded once and re-read from here, so they survive restarts and don't
+/// re-hit the network. The JID is sanitized to a safe filename.
+pub fn avatar_cache_path(jid: &str) -> anyhow::Result<PathBuf> {
+    let mut dir = glib::user_cache_dir();
+    dir.push(DATA_SUBDIR);
+    dir.push("avatars");
+    std::fs::create_dir_all(&dir)?;
+    dir.push(format!("{}.jpg", sanitize(jid)));
+    Ok(dir)
+}
+
+/// Maps a JID to a safe filename stem: every non-alphanumeric byte becomes `_`.
+fn sanitize(jid: &str) -> String {
+    jid.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
+}

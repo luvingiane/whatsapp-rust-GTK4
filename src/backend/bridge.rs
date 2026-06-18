@@ -47,6 +47,9 @@ pub enum WaEvent {
         jid: String,
         messages: Vec<MessageRow>,
     },
+    /// A profile picture is available on disk for `jid` (requested via
+    /// [`WaCommand::FetchAvatar`]). The UI loads it into a `gdk::Texture`.
+    Avatar { jid: String, path: String },
 }
 
 /// Commands flowing **from** the GTK UI **to** the WhatsApp backend.
@@ -67,6 +70,9 @@ pub enum WaCommand {
         before_id: String,
         count: i64,
     },
+    /// Fetch (download + disk-cache) the profile picture for `jid`; the backend
+    /// replies with [`WaEvent::Avatar`] if one is available.
+    FetchAvatar(String),
     /// Ask the backend to stop its run loop (sent when the window closes).
     Shutdown,
 }

@@ -2,7 +2,9 @@
 //! its [`Event`]s into our [`WaEvent`]s and into the application [`Store`].
 //! Everything here runs on the Tokio runtime thread spawned by [`super::runtime`].
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -152,6 +154,11 @@ pub async fn run(
         });
     }
 
+    // Client handle + in-flight set for avatar downloads (deduped, off the
+    // command loop so a slow network never blocks OpenChat/LoadOlder).
+    let cmd_client = handle.client();
+    let avatar_inflight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+
     // Serve UI commands until the window closes (Shutdown) or the run loop ends.
     loop {
         tokio::select! {
@@ -181,6 +188,9 @@ pub async fn run(
                         Err(e) => warn!("load_messages_before failed: {e:?}"),
                     }
                 }
+                Ok(WaCommand::FetchAvatar(jid)) => {
+                    spawn_fetch_avatar(jid, &cmd_client, &event_tx, &avatar_inflight);
+                }
                 Ok(WaCommand::Shutdown) => {
                     info!("shutdown requested by UI");
                     handle.shutdown().await;
@@ -196,6 +206,81 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+/// Resolves a profile picture for `jid` and notifies the UI when it lands on
+/// disk. A cache hit replies immediately; otherwise the download runs in a
+/// spawned task (deduped via `inflight`) so the command loop stays responsive.
+fn spawn_fetch_avatar(
+    jid: String,
+    client: &Arc<Client>,
+    tx: &Sender<WaEvent>,
+    inflight: &Arc<Mutex<HashSet<String>>>,
+) {
+    let client = client.clone();
+    let tx = tx.clone();
+    let inflight = inflight.clone();
+    tokio::spawn(async move {
+        let path = match config::avatar_cache_path(&jid) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("avatar_cache_path failed for {jid}: {e:?}");
+                return;
+            }
+        };
+        // Cache hit: nothing to download.
+        if path.exists() {
+            let _ = tx
+                .send(WaEvent::Avatar {
+                    jid,
+                    path: path.to_string_lossy().into_owned(),
+                })
+                .await;
+            return;
+        }
+        // Dedup concurrent downloads for the same JID.
+        if !inflight.lock().unwrap().insert(jid.clone()) {
+            return;
+        }
+        let result = download_avatar(&client, &jid, &path).await;
+        inflight.lock().unwrap().remove(&jid);
+        match result {
+            Ok(true) => {
+                let _ = tx
+                    .send(WaEvent::Avatar {
+                        jid,
+                        path: path.to_string_lossy().into_owned(),
+                    })
+                    .await;
+            }
+            Ok(false) => {} // no picture set for this contact
+            Err(e) => warn!("avatar download failed for {jid}: {e:?}"),
+        }
+    });
+}
+
+/// Fetches the preview profile picture URL for `jid` and writes the bytes to
+/// `path`. Returns `Ok(false)` if the contact has no picture.
+async fn download_avatar(client: &Arc<Client>, jid: &str, path: &Path) -> Result<bool> {
+    let parsed: whatsapp_rust::Jid = jid.parse()?;
+    let contacts = client.contacts();
+    let Some(pic) = contacts.get_profile_picture(&parsed, true).await? else {
+        return Ok(false);
+    };
+    if pic.url.is_empty() {
+        return Ok(false);
+    }
+    let url = pic.url.clone();
+    let dest = path.to_path_buf();
+    // ureq is blocking and std::fs::write is sync, so do both off the runtime.
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut body = ureq::get(&url).call()?.into_body();
+        let bytes = body.read_to_vec()?;
+        std::fs::write(&dest, &bytes)?;
+        Ok(())
+    })
+    .await??;
+    Ok(true)
 }
 
 /// Translates a single whatsapp-rust [`Event`] into UI updates and store writes.

@@ -26,6 +26,10 @@ mod imp {
         pub timestamp: RefCell<String>,
         #[property(get, set)]
         pub unread: Cell<u32>,
+        // Profile-picture paintable (a `gdk::Texture`), bound to the row's
+        // Avatar `custom-image`; `None` until the picture has been downloaded.
+        #[property(get, set, nullable)]
+        pub avatar: RefCell<Option<gtk::gdk::Paintable>>,
     }
 
     #[glib::object_subclass]

@@ -9,18 +9,31 @@ use gtk::{gio, glib};
 use libadwaita as adw;
 
 use super::chat_object::ChatObject;
+use super::AvatarCache;
 use crate::model::ChatSummary;
+
+/// Key under which each row's avatar property-binding is stashed on its
+/// `ListItem`, so it can be torn down when the row is recycled.
+const AVATAR_BINDING_KEY: &str = "wrg-avatar-binding";
+
+type NeedAvatarCb = Rc<RefCell<Option<Box<dyn Fn(String)>>>>;
 
 #[derive(Clone)]
 pub struct ChatList {
     pub root: gtk::Box,
     store: gio::ListStore,
     list_view: gtk::ListView,
+    /// Shared decoded-texture cache (filled by [`Self::set_avatar`]).
+    avatars: AvatarCache,
+    /// Invoked with a JID when a visible row still lacks its avatar.
+    on_need_avatar: NeedAvatarCb,
 }
 
 impl ChatList {
-    pub fn new() -> Self {
+    pub fn new(avatars: &AvatarCache) -> Self {
         let store = gio::ListStore::new::<ChatObject>();
+        let avatars = avatars.clone();
+        let on_need_avatar: NeedAvatarCb = Rc::new(RefCell::new(None));
 
         // Live name/number filter driven by the search entry below.
         let query: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
@@ -49,17 +62,44 @@ impl ChatList {
                 item.set_child(Some(&build_row()));
             }
         });
-        factory.connect_bind(|_, item| {
+        {
+            let on_need_avatar = on_need_avatar.clone();
+            factory.connect_bind(move |_, item| {
+                let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
+                    return;
+                };
+                let Some(obj) = item.item().and_downcast::<ChatObject>() else {
+                    return;
+                };
+                let Some(row) = item.child().and_downcast::<gtk::Box>() else {
+                    return;
+                };
+                bind_row(&row, &obj);
+
+                // Drive the Avatar's image from the object's `avatar` property so
+                // a late-arriving download updates this (recycled) row live.
+                if let Some((avatar, ..)) = row_widgets(&row) {
+                    let binding = obj
+                        .bind_property("avatar", &avatar, "custom-image")
+                        .sync_create()
+                        .build();
+                    unsafe { item.set_data(AVATAR_BINDING_KEY, binding) };
+                }
+                // No picture yet → ask the backend to fetch it.
+                if obj.avatar().is_none() {
+                    if let Some(cb) = on_need_avatar.borrow().as_ref() {
+                        cb(obj.jid());
+                    }
+                }
+            });
+        }
+        factory.connect_unbind(|_, item| {
             let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
                 return;
             };
-            let Some(obj) = item.item().and_downcast::<ChatObject>() else {
-                return;
-            };
-            let Some(row) = item.child().and_downcast::<gtk::Box>() else {
-                return;
-            };
-            bind_row(&row, &obj);
+            if let Some(binding) = unsafe { item.steal_data::<glib::Binding>(AVATAR_BINDING_KEY) } {
+                binding.unbind();
+            }
         });
 
         let list_view = gtk::ListView::builder()
@@ -96,17 +136,53 @@ impl ChatList {
             root,
             store,
             list_view,
+            avatars,
+            on_need_avatar,
         }
     }
 
-    /// Replaces the whole list with a fresh, ordered snapshot.
+    /// Replaces the whole list with a fresh, ordered snapshot. Cached avatars are
+    /// applied to the new objects so already-downloaded pictures show immediately.
     pub fn update(&self, chats: &[ChatSummary]) {
+        let cache = self.avatars.borrow();
         let objs: Vec<glib::Object> = chats
             .iter()
-            .map(|c| ChatObject::new(c).upcast::<glib::Object>())
+            .map(|c| {
+                let obj = ChatObject::new(c);
+                if let Some(tex) = cache.get(&c.jid) {
+                    let p = tex.clone().upcast::<gtk::gdk::Paintable>();
+                    obj.set_property("avatar", &p);
+                }
+                obj.upcast::<glib::Object>()
+            })
             .collect();
+        drop(cache);
         self.store.remove_all();
         self.store.splice(0, 0, &objs);
+    }
+
+    /// Registers the callback invoked (with a JID) when a visible row needs its
+    /// avatar fetched.
+    pub fn connect_need_avatar<F: Fn(String) + 'static>(&self, f: F) {
+        *self.on_need_avatar.borrow_mut() = Some(Box::new(f));
+    }
+
+    /// Caches a freshly downloaded texture and applies it to the matching row
+    /// (the property binding updates the visible Avatar).
+    pub fn set_avatar(&self, jid: &str, tex: &gtk::gdk::Texture) {
+        self.avatars
+            .borrow_mut()
+            .insert(jid.to_string(), tex.clone());
+        let paintable = tex.clone().upcast::<gtk::gdk::Paintable>();
+        let n = self.store.n_items();
+        for i in 0..n {
+            if let Some(obj) = self.store.item(i).and_downcast::<ChatObject>() {
+                if obj.jid() == jid {
+                    obj.set_property("avatar", &paintable);
+                    break;
+                }
+            }
+        }
     }
 
     /// Calls `f(jid, name)` when a chat row is activated (single click / Enter).
