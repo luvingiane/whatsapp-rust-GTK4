@@ -1,9 +1,10 @@
 //! Wires everything together: creates the libadwaita application, spawns the
 //! Tokio backend, and bridges backend events to the UI on the GTK main loop.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use adw::prelude::*;
 use gtk::glib;
@@ -124,11 +125,50 @@ fn on_activate(app: &adw::Application) {
         win.archived_list.connect_need_avatar(need3);
     }
 
+    // Presence: be "available" only while the window is focused AND the user is
+    // active; "unavailable" when unfocused or idle, so the phone resumes its own
+    // notifications when we step away. Presence is dropped on reconnect, so we
+    // re-assert it on `Connected`.
+    let presence = Rc::new(PresenceDriver::new(command_tx.clone()));
+    presence.set_focused(win.window.is_active());
+    {
+        let presence = presence.clone();
+        win.window
+            .connect_is_active_notify(move |w| presence.set_focused(w.is_active()));
+    }
+    {
+        // Pointer/keyboard activity on the window resets the idle timer.
+        let motion = gtk::EventControllerMotion::new();
+        {
+            let presence = presence.clone();
+            motion.connect_motion(move |_, _, _| presence.mark_active());
+        }
+        win.window.add_controller(motion);
+        let key = gtk::EventControllerKey::new();
+        {
+            let presence = presence.clone();
+            key.connect_key_pressed(move |_, _, _, _| {
+                presence.mark_active();
+                glib::Propagation::Proceed
+            });
+        }
+        win.window.add_controller(key);
+    }
+    {
+        // Periodic idle check: after IDLE without input we go unavailable.
+        let presence = presence.clone();
+        glib::timeout_add_seconds_local(60, move || {
+            presence.tick_idle();
+            glib::ControlFlow::Continue
+        });
+    }
+
     // Drain backend events on the GTK main loop. `spawn_future_local` guarantees
     // this future runs on the main thread, so it is safe to touch widgets here.
     let win_ev = win.clone();
     let event_rx = chans.event_rx.clone();
     let current_open_ev = current_open.clone();
+    let presence_ev = presence.clone();
     glib::spawn_future_local(async move {
         while let Ok(ev) = event_rx.recv().await {
             match ev {
@@ -152,6 +192,9 @@ fn on_activate(app: &adw::Application) {
                 WaEvent::Connected { jid } => {
                     win_ev.set_account(jid.as_deref());
                     win_ev.show_main();
+                    // Presence is lost across reconnects: re-send the current state.
+                    presence_ev.set_focused(win_ev.window.is_active());
+                    presence_ev.reassert();
                 }
                 // Transient drop: whatsapp-rust reconnects on its own; stay put.
                 WaEvent::Disconnected => {}
@@ -228,6 +271,78 @@ fn on_activate(app: &adw::Application) {
     });
 
     win.window.present();
+}
+
+/// How long the window can go without pointer/keyboard input before we report
+/// the user as away (presence unavailable), even if the window keeps focus.
+const IDLE: Duration = Duration::from_secs(300);
+
+/// Tracks window focus + input idleness and pushes presence to the backend,
+/// de-duplicated so we only send on real state changes. Lives on the GTK main
+/// thread (`!Send`), driven by focus notifies, input controllers and an idle tick.
+struct PresenceDriver {
+    tx: async_channel::Sender<WaCommand>,
+    focused: Cell<bool>,
+    last_input: Cell<Instant>,
+    idle: Cell<bool>,
+    last_sent: Cell<Option<bool>>,
+}
+
+impl PresenceDriver {
+    fn new(tx: async_channel::Sender<WaCommand>) -> Self {
+        Self {
+            tx,
+            focused: Cell::new(false),
+            last_input: Cell::new(Instant::now()),
+            idle: Cell::new(false),
+            last_sent: Cell::new(None),
+        }
+    }
+
+    /// Available only when the window is focused and the user is not idle.
+    fn desired(&self) -> bool {
+        self.focused.get() && !self.idle.get()
+    }
+
+    /// Sends the current desired presence, skipping a redundant resend unless
+    /// `force` (used after a reconnect, which drops presence server-side).
+    fn apply(&self, force: bool) {
+        let available = self.desired();
+        if force || self.last_sent.get() != Some(available) {
+            self.last_sent.set(Some(available));
+            let _ = self.tx.try_send(WaCommand::SetPresence { available });
+        }
+    }
+
+    fn set_focused(&self, focused: bool) {
+        self.focused.set(focused);
+        if focused {
+            self.last_input.set(Instant::now());
+            self.idle.set(false);
+        }
+        self.apply(false);
+    }
+
+    fn mark_active(&self) {
+        self.last_input.set(Instant::now());
+        if self.idle.get() {
+            self.idle.set(false);
+            self.apply(false);
+        }
+    }
+
+    fn tick_idle(&self) {
+        let idle = self.last_input.get().elapsed() >= IDLE;
+        if idle != self.idle.get() {
+            self.idle.set(idle);
+            self.apply(false);
+        }
+    }
+
+    /// Re-send the current state even if unchanged (presence is lost on reconnect).
+    fn reassert(&self) {
+        self.apply(true);
+    }
 }
 
 /// Shows a fatal startup error on the login view and presents the window.

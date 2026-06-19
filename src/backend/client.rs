@@ -230,6 +230,20 @@ pub async fn run(
                 Ok(WaCommand::FetchAvatar(jid)) => {
                     spawn_fetch_avatar(jid, &cmd_client, &event_tx, &avatar_inflight);
                 }
+                Ok(WaCommand::SetPresence { available }) => {
+                    let presence = cmd_client.presence();
+                    let res = if available {
+                        presence.set_available().await
+                    } else {
+                        presence.set_unavailable().await
+                    };
+                    match res {
+                        Ok(()) => info!("presence -> {}", if available { "available" } else { "unavailable" }),
+                        // Push name not yet known (early post-login): the UI re-sends
+                        // presence on focus and on Connected, so this self-heals.
+                        Err(e) => warn!("set presence (available={available}) failed: {e:?}"),
+                    }
+                }
                 Ok(WaCommand::Shutdown) => {
                     info!("shutdown requested by UI");
                     handle.shutdown().await;

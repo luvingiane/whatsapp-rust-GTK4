@@ -84,6 +84,10 @@ pub enum WaCommand {
     /// Fetch (download + disk-cache) the profile picture for `jid`; the backend
     /// replies with [`WaEvent::Avatar`] if one is available.
     FetchAvatar(String),
+    /// Announce our presence to WhatsApp: `true` = available (window focused/active),
+    /// `false` = unavailable (unfocused or idle). When we never go unavailable the
+    /// phone treats this device as active and withholds its own notifications.
+    SetPresence { available: bool },
     /// Ask the backend to stop its run loop (sent when the window closes).
     Shutdown,
 }
