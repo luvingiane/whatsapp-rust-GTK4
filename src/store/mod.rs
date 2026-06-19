@@ -536,12 +536,15 @@ impl Store {
         .await?
     }
 
-    /// Inserts a single live message (idempotent on `(chat_jid,id)`).
-    pub async fn insert_message(&self, m: MessageRow) -> Result<()> {
+    /// Inserts a single live message (idempotent on `(chat_jid,id)`). Returns
+    /// `true` if the row was newly inserted, `false` if it already existed — used
+    /// to suppress the self-fanout echo of a message we already inserted
+    /// optimistically on send (avoids a duplicate bubble).
+    pub async fn insert_message(&self, m: MessageRow) -> Result<bool> {
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<()> {
+        tokio::task::spawn_blocking(move || -> Result<bool> {
             let guard = conn.lock().map_err(|_| anyhow!("store mutex poisoned"))?;
-            guard.execute(
+            let n = guard.execute(
                 "INSERT OR IGNORE INTO messages (chat_jid,id,sender_jid,from_me,ts,body,status)
                  VALUES (?1,?2,?3,?4,?5,?6,?7)",
                 params![
@@ -554,7 +557,7 @@ impl Store {
                     m.status
                 ],
             )?;
-            Ok(())
+            Ok(n > 0)
         })
         .await?
     }

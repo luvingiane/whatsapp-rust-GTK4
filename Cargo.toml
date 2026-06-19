@@ -59,6 +59,11 @@ anyhow = "1"
 log = "0.4"
 env_logger = "0.11"
 
+# --- voice-note recording (mic capture + Opus/OGG encoding) ------------------
+# Records WhatsApp PTT notes via a GStreamer pipeline (autoaudiosrc → opusenc →
+# oggmux). Needs the GStreamer runtime + base/good plugins (opus, ogg) installed.
+gstreamer = "0.23"
+
 [profile.release]
 lto = "thin"
 strip = true

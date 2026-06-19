@@ -11,11 +11,14 @@ use anyhow::Result;
 use async_channel::{Receiver, Sender};
 use log::{error, info, warn};
 use tokio::sync::Notify;
+use wacore::download::MediaType;
 use wacore::store::DevicePropsOverride;
 use wacore::types::events::Event;
 use wacore::types::presence::ReceiptType;
 use whatsapp_rust::bot::Bot;
 use whatsapp_rust::client::Client;
+use whatsapp_rust::media::{audio_message, AudioOptions};
+use whatsapp_rust::UploadOptions;
 use whatsapp_rust::waproto::whatsapp as wa;
 use whatsapp_rust::waproto::whatsapp::device_props::PlatformType;
 use whatsapp_rust::TokioRuntime;
@@ -244,6 +247,51 @@ pub async fn run(
                         Err(e) => warn!("set presence (available={available}) failed: {e:?}"),
                     }
                 }
+                Ok(WaCommand::SendText { jid, text }) => {
+                    let text = text.trim().to_string();
+                    if !text.is_empty() {
+                        match jid.parse::<whatsapp_rust::Jid>() {
+                            Ok(to) => match cmd_client.send_text(to, text.clone()).await {
+                                Ok(res) => {
+                                    store_outgoing(&store, &event_tx, &dirty, jid, text, res.message_id).await;
+                                }
+                                Err(e) => {
+                                    warn!("send_text failed: {e:?}");
+                                    let _ = event_tx.send(WaEvent::Error(format!("Invio fallito: {e}"))).await;
+                                }
+                            },
+                            Err(e) => warn!("send_text: bad jid {jid}: {e:?}"),
+                        }
+                    }
+                }
+                Ok(WaCommand::SendAudio { jid, ogg, duration }) => {
+                    match jid.parse::<whatsapp_rust::Jid>() {
+                        Ok(to) => match cmd_client.upload(ogg, MediaType::Audio, UploadOptions::default()).await {
+                            Ok(up) => {
+                                let msg = audio_message(up, AudioOptions {
+                                    ptt: Some(true),
+                                    duration_seconds: Some(duration),
+                                    mimetype: None,
+                                    waveform: None,
+                                });
+                                match cmd_client.send_message(to, msg).await {
+                                    Ok(res) => {
+                                        store_outgoing(&store, &event_tx, &dirty, jid, "🎤 Messaggio vocale".to_string(), res.message_id).await;
+                                    }
+                                    Err(e) => {
+                                        warn!("send audio failed: {e:?}");
+                                        let _ = event_tx.send(WaEvent::Error(format!("Invio vocale fallito: {e}"))).await;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!("audio upload failed: {e:?}");
+                                let _ = event_tx.send(WaEvent::Error(format!("Upload vocale fallito: {e}"))).await;
+                            }
+                        },
+                        Err(e) => warn!("send_audio: bad jid {jid}: {e:?}"),
+                    }
+                }
                 Ok(WaCommand::Shutdown) => {
                     info!("shutdown requested by UI");
                     handle.shutdown().await;
@@ -334,6 +382,41 @@ async fn download_avatar(client: &Arc<Client>, jid: &str, path: &Path) -> Result
     })
     .await??;
     Ok(true)
+}
+
+/// Inserts a message we just sent into the store (optimistic, status = Sent) and
+/// notifies the UI so the bubble appears immediately. The later self-fanout echo
+/// is suppressed by `insert_message` returning `false` for the duplicate id.
+async fn store_outgoing(
+    store: &Store,
+    tx: &Sender<WaEvent>,
+    dirty: &Notify,
+    chat: String,
+    body: String,
+    id: String,
+) {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let row = MessageRow {
+        id,
+        chat_jid: chat.clone(),
+        sender_jid: String::new(),
+        sender_name: String::new(),
+        from_me: true,
+        ts,
+        body: body.clone(),
+        status: 1,
+    };
+    if let Err(e) = store.insert_message(row.clone()).await {
+        warn!("store_outgoing insert failed: {e:?}");
+    }
+    if let Err(e) = store.apply_message(chat, body, ts, true, 1).await {
+        warn!("store_outgoing apply failed: {e:?}");
+    }
+    let _ = tx.send(WaEvent::NewMessage(row)).await;
+    dirty.notify_one();
 }
 
 /// Translates a single whatsapp-rust [`Event`] into UI updates and store writes.
@@ -493,19 +576,9 @@ async fn handle_event(
                     // Our own live message is at least server-acked → one tick;
                     // incoming messages carry no status.
                     let status = if from_me { 1 } else { 0 };
-                    info!(
-                        "message: from_me={from_me} status={status} id={} chat={chat}",
-                        info.id
-                    );
-                    if let Err(e) = store
-                        .apply_message(chat.clone(), body.clone(), ts, from_me, status)
-                        .await
-                    {
-                        warn!("apply_message failed: {e:?}");
-                    }
                     let row = MessageRow {
                         id: info.id.clone(),
-                        chat_jid: chat,
+                        chat_jid: chat.clone(),
                         sender_jid: info.source.sender.to_string(),
                         // Sender's profile name straight from the event (group labels);
                         // empty for our own messages.
@@ -516,14 +589,30 @@ async fn handle_event(
                         },
                         from_me,
                         ts,
-                        body,
+                        body: body.clone(),
                         status,
                     };
-                    if let Err(e) = store.insert_message(row.clone()).await {
-                        warn!("insert_message failed: {e:?}");
+                    // Insert first: a `false` means this is the self-fanout echo of
+                    // a message we already inserted on send — skip the preview bump
+                    // and the UI append so we don't duplicate the bubble.
+                    let inserted = match store.insert_message(row.clone()).await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!("insert_message failed: {e:?}");
+                            false
+                        }
+                    };
+                    if inserted {
+                        info!("message: from_me={from_me} status={status} id={} chat={chat}", info.id);
+                        if let Err(e) = store
+                            .apply_message(chat, body, ts, from_me, status)
+                            .await
+                        {
+                            warn!("apply_message failed: {e:?}");
+                        }
+                        let _ = tx.send(WaEvent::NewMessage(row)).await;
+                        dirty.notify_one();
                     }
-                    let _ = tx.send(WaEvent::NewMessage(row)).await;
-                    dirty.notify_one();
                 }
             }
         }

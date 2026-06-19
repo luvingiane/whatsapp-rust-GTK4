@@ -125,6 +125,26 @@ fn on_activate(app: &adw::Application) {
         win.archived_list.connect_need_avatar(need3);
     }
 
+    // Composer: send text / voice note to the currently open chat.
+    {
+        let command_tx = command_tx.clone();
+        let current_open = current_open.clone();
+        win.thread.connect_send(move |text| {
+            if let Some(jid) = current_open.borrow().clone() {
+                let _ = command_tx.try_send(WaCommand::SendText { jid, text });
+            }
+        });
+    }
+    {
+        let command_tx = command_tx.clone();
+        let current_open = current_open.clone();
+        win.thread.connect_send_audio(move |ogg, duration| {
+            if let Some(jid) = current_open.borrow().clone() {
+                let _ = command_tx.try_send(WaCommand::SendAudio { jid, ogg, duration });
+            }
+        });
+    }
+
     // Presence: be "available" only while the window is focused AND the user is
     // active; "unavailable" when unfocused or idle, so the phone resumes its own
     // notifications when we step away. Presence is dropped on reconnect, so we
