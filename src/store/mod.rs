@@ -202,6 +202,27 @@ impl Store {
         .await?
     }
 
+    /// Sets a chat's unread counter. Used to clear it (n=0) when the chat is read
+    /// — either opened locally or marked read on another device (the phone) via
+    /// an app-state `MarkChatAsReadAction`. Keyed by `jid`; a no-op if no row.
+    pub async fn set_unread(&self, jid: String, n: i64) -> Result<()> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let guard = conn.lock().map_err(|_| anyhow!("store mutex poisoned"))?;
+            guard.execute(
+                "UPDATE chats SET unread=?2 WHERE jid=?1",
+                params![jid, n],
+            )?;
+            Ok(())
+        })
+        .await?
+    }
+
+    /// Convenience: clears a chat's unread counter (marks it read).
+    pub async fn clear_unread(&self, jid: String) -> Result<()> {
+        self.set_unread(jid, 0).await
+    }
+
     /// Sets the saved (address-book) name for a chat, from a `ContactAction`.
     pub async fn set_saved_name(&self, jid: String, name: String) -> Result<()> {
         if name.is_empty() {
@@ -266,14 +287,36 @@ impl Store {
     }
 
     /// Returns the non-archived chats, pinned first then most-recent first.
+    ///
+    /// Chats with no displayable preview (`last_message` empty — e.g. only
+    /// system/protocol messages, or whose content sync stalled) are hidden here
+    /// to match the wrapper's active list. NOTE: an empty preview is really a
+    /// sync bug we should fix later; the filter is a deliberate stopgap.
     pub async fn list_chats(&self) -> Result<Vec<ChatSummary>> {
+        self.query_chats(false).await
+    }
+
+    /// Returns the archived chats, pinned first then most-recent first. Empty
+    /// previews are kept: this view simply lists everything that is archived.
+    pub async fn list_archived_chats(&self) -> Result<Vec<ChatSummary>> {
+        self.query_chats(true).await
+    }
+
+    /// Shared chat-list query. `archived` selects the archived set (`=1`) vs the
+    /// active set (`=0`, with empty-preview chats hidden). Archive/pin come from
+    /// `chat_meta` (app-state), independent of the chat row.
+    async fn query_chats(&self, archived: bool) -> Result<Vec<ChatSummary>> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || -> Result<Vec<ChatSummary>> {
             let guard = conn.lock().map_err(|_| anyhow!("store mutex poisoned"))?;
             // Resolve the display name: group subject → saved address-book name
-            // → contact pushname → (number, filled in below). Archive/pin come
-            // from chat_meta (app-state), independent of the chat row.
-            let mut stmt = guard.prepare(
+            // → contact pushname → (number, filled in below).
+            let filter = if archived {
+                "WHERE COALESCE(m.archived,0)=1"
+            } else {
+                "WHERE COALESCE(m.archived,0)=0 AND c.last_message<>''"
+            };
+            let sql = format!(
                 "SELECT c.jid,
                         COALESCE(NULLIF(c.name,''), NULLIF(m.saved_name,''), NULLIF(ct.name,''), '') AS name,
                         c.last_message, c.last_ts, c.last_from_me, c.unread, c.is_group,
@@ -281,9 +324,10 @@ impl Store {
                  FROM chats c
                  LEFT JOIN contacts ct ON ct.jid = c.jid
                  LEFT JOIN chat_meta m ON m.jid = c.jid
-                 WHERE COALESCE(m.archived,0)=0
-                 ORDER BY pinned DESC, c.last_ts DESC",
-            )?;
+                 {filter}
+                 ORDER BY pinned DESC, c.last_ts DESC"
+            );
+            let mut stmt = guard.prepare(&sql)?;
             let rows = stmt
                 .query_map([], |r| {
                     let jid: String = r.get(0)?;

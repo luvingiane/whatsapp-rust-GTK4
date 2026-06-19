@@ -31,6 +31,9 @@ pub enum WaEvent {
     /// The full, ordered chat list (sidebar). Sent after history sync and,
     /// debounced, whenever the store changes.
     ChatsSnapshot(Vec<ChatSummary>),
+    /// The full, ordered archived chat list. Sent alongside [`Self::ChatsSnapshot`]
+    /// so the archived view and its count stay in sync with the active list.
+    ArchivedChatsSnapshot(Vec<ChatSummary>),
     /// The message history for a chat the UI requested via [`WaCommand::OpenChat`],
     /// oldest-first.
     ChatHistory {
