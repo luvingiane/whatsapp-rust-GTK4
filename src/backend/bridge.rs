@@ -53,6 +53,14 @@ pub enum WaEvent {
     /// A profile picture is available on disk for `jid` (requested via
     /// [`WaCommand::FetchAvatar`]). The UI loads it into a `gdk::Texture`.
     Avatar { jid: String, path: String },
+    /// A delivery/read receipt advanced the status of one or more of our sent
+    /// messages (1 sent, 2 delivered, 3 read). The UI updates the ✓/✓✓ glyph on
+    /// the matching bubbles if the chat is open.
+    ReceiptUpdate {
+        chat_jid: String,
+        message_ids: Vec<String>,
+        status: i32,
+    },
 }
 
 /// Commands flowing **from** the GTK UI **to** the WhatsApp backend.

@@ -20,6 +20,9 @@ pub struct ChatSummary {
     pub is_group: bool,
     /// Whether the chat is pinned (sorted above the rest).
     pub pinned: bool,
+    /// Delivery status of the last message when `last_from_me` (0 none, 1 sent,
+    /// 2 delivered, 3 read), for the ✓/✓✓ glyph in the preview.
+    pub last_status: i32,
 }
 
 /// A single message in a conversation, as shown in the thread view. Produced by
@@ -41,4 +44,7 @@ pub struct MessageRow {
     pub ts: i64,
     /// Display text: the message text, or a media placeholder ("📷 Foto", …).
     pub body: String,
+    /// Delivery status for our own messages: 0 none/incoming, 1 sent (✓),
+    /// 2 delivered (✓✓), 3 read/played (✓✓ blue).
+    pub status: i32,
 }

@@ -342,7 +342,7 @@ fn bind_row(row: &gtk::Box, obj: &ChatObject) {
     let display = obj.name();
     avatar.set_text(Some(&display));
     name.set_label(&display);
-    msg.set_label(&obj.last_message());
+    set_preview(&msg, obj);
     time.set_label(&obj.timestamp());
 
     let unread = obj.unread();
@@ -352,6 +352,32 @@ fn bind_row(row: &gtk::Box, obj: &ChatObject) {
     } else {
         badge.set_label("");
         badge.set_visible(false);
+    }
+}
+
+/// Sets the preview label, prefixing a ✓/✓✓ delivery glyph when the last message
+/// was ours (blue when read), like the wrapper. Uses Pango markup to colour just
+/// the glyph; the body is escaped.
+fn set_preview(msg: &gtk::Label, obj: &ChatObject) {
+    let body = obj.last_message();
+    let glyph = if obj.last_from_me() {
+        match obj.last_status() {
+            1 => "✓",
+            2 | 3 => "✓✓",
+            _ => "",
+        }
+    } else {
+        ""
+    };
+    if glyph.is_empty() {
+        msg.set_text(&body);
+        return;
+    }
+    let esc = glib::markup_escape_text(&body);
+    if obj.last_status() >= 3 {
+        msg.set_markup(&format!("<span foreground='#53bdeb'>{glyph}</span> {esc}"));
+    } else {
+        msg.set_markup(&format!("{glyph} {esc}"));
     }
 }
 

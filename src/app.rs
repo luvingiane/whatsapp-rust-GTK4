@@ -195,6 +195,20 @@ fn on_activate(app: &adw::Application) {
                         win_ev.thread.prepend_history(&messages);
                     }
                 }
+                // A receipt advanced our sent messages' status: update the open
+                // thread's ticks live. The chat-list preview refreshes via the
+                // debounced snapshot triggered backend-side.
+                WaEvent::ReceiptUpdate {
+                    chat_jid,
+                    message_ids,
+                    status,
+                } => {
+                    if current_open_ev.borrow().as_deref() == Some(chat_jid.as_str()) {
+                        for id in &message_ids {
+                            win_ev.thread.set_status(id, status);
+                        }
+                    }
+                }
                 // A profile picture landed on disk: decode it and update widgets.
                 WaEvent::Avatar { jid, path } => {
                     if let Ok(tex) = gtk::gdk::Texture::from_filename(&path) {
@@ -240,7 +254,9 @@ fn load_css() {
             margin: 1px 0px; \
          } \
          .bubble-in { background-color: alpha(currentColor, 0.08); } \
-         .bubble-out { background-color: alpha(@accent_bg_color, 0.85); color: @accent_fg_color; }",
+         .bubble-out { background-color: alpha(@accent_bg_color, 0.85); color: @accent_fg_color; } \
+         .tick { font-size: 0.8em; opacity: 0.85; } \
+         .tick-read { color: #53bdeb; opacity: 1; }",
     );
     if let Some(display) = gtk::gdk::Display::default() {
         gtk::style_context_add_provider_for_display(

@@ -27,7 +27,10 @@ CREATE TABLE IF NOT EXISTS chats (
   is_group     INTEGER NOT NULL DEFAULT 0,
   archived     INTEGER NOT NULL DEFAULT 0,
   pinned       INTEGER NOT NULL DEFAULT 0,
-  muted_until  INTEGER NOT NULL DEFAULT 0
+  muted_until  INTEGER NOT NULL DEFAULT 0,
+  -- Delivery status of the last message when we sent it (0 none, 1 sent,
+  -- 2 delivered, 3 read), for the ✓/✓✓ glyph in the chat-list preview.
+  last_status  INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS contacts (
   jid  TEXT PRIMARY KEY,
@@ -43,6 +46,14 @@ CREATE TABLE IF NOT EXISTS chat_meta (
   muted_until INTEGER NOT NULL DEFAULT 0,
   saved_name  TEXT NOT NULL DEFAULT ''
 );
+-- Learned LID(@lid) ↔ PN(@s.whatsapp.net) JID pairs. App-state events (archive,
+-- pin, …) arrive keyed by @lid while 1:1 chats are keyed by PN; this map lets us
+-- re-key the metadata onto the chat row. Learned from ContactUpdate (pn/lid jids)
+-- and message source alt-forms, which the LID↔PN library map fills only slowly.
+CREATE TABLE IF NOT EXISTS lid_map (
+  lid TEXT PRIMARY KEY,
+  pn  TEXT NOT NULL
+);
 -- Per-chat message history for the conversation view. (chat_jid,id) is unique so
 -- repeated history syncs / reconnects don't duplicate rows.
 CREATE TABLE IF NOT EXISTS messages (
@@ -52,10 +63,36 @@ CREATE TABLE IF NOT EXISTS messages (
   from_me    INTEGER NOT NULL DEFAULT 0,
   ts         INTEGER NOT NULL DEFAULT 0,
   body       TEXT NOT NULL DEFAULT '',
+  -- Delivery status for our own messages: 0 none/incoming, 1 sent (✓),
+  -- 2 delivered (✓✓), 3 read/played (✓✓ blue).
+  status     INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (chat_jid, id)
 );
 CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages(chat_jid, ts);
 ";
+
+/// Additive, idempotent column migrations for DBs created before a column
+/// existed. `ALTER TABLE ADD COLUMN` errors if the column is already present, so
+/// each is run independently and a duplicate-column error is ignored — we never
+/// recreate or drop the existing session DB.
+const MIGRATIONS: &[&str] = &[
+    "ALTER TABLE chats ADD COLUMN last_status INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE messages ADD COLUMN status INTEGER NOT NULL DEFAULT 0",
+];
+
+/// Run on every open. (1) Baseline ✓ for our own messages that lack a status.
+/// (2) Derive each chat's `last_status` from its latest own message — so the
+/// list-preview tick is correct on a plain relaunch (no fresh history sync, which
+/// only happens at pairing) using the per-message status already stored.
+const BACKFILL: &[&str] = &[
+    "UPDATE messages SET status=1 WHERE from_me=1 AND status=0",
+    "UPDATE chats SET last_status = COALESCE((
+        SELECT m.status FROM messages m
+        WHERE m.chat_jid=chats.jid AND m.from_me=1
+        ORDER BY m.ts DESC, m.id DESC LIMIT 1
+     ), last_status)
+     WHERE last_from_me=1",
+];
 
 /// An owned chat row to upsert. We extract these from the (borrowed) protobuf on
 /// the async side so the values can move into `spawn_blocking`.
@@ -65,6 +102,7 @@ pub struct ChatUpsert {
     pub last_message: String,
     pub last_ts: i64,
     pub last_from_me: bool,
+    pub last_status: i32,
     pub unread: u32,
     pub is_group: bool,
     pub archived: bool,
@@ -87,6 +125,22 @@ impl Store {
             // WAL keeps reads/writes from blocking each other and is crash-safe.
             conn.pragma_update(None, "journal_mode", "WAL")?;
             conn.execute_batch(SCHEMA)?;
+            // Bring older DBs up to date without recreating them. A
+            // duplicate-column error just means the migration already ran.
+            for sql in MIGRATIONS {
+                if let Err(e) = conn.execute(sql, []) {
+                    let msg = e.to_string();
+                    if !msg.contains("duplicate column name") {
+                        return Err(e.into());
+                    }
+                }
+            }
+            // Baseline ✓ for our own messages imported before `status` existed
+            // (they'd otherwise show no tick). Idempotent: only touches status 0.
+            // Live receipts / re-syncs later upgrade these to ✓✓ / read.
+            for sql in BACKFILL {
+                conn.execute(sql, [])?;
+            }
             Ok(conn)
         })
         .await??;
@@ -106,8 +160,8 @@ impl Store {
             {
                 let mut stmt = tx.prepare(
                     "INSERT INTO chats
-                       (jid,name,last_message,last_ts,last_from_me,unread,is_group,archived,pinned,muted_until)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+                       (jid,name,last_message,last_ts,last_from_me,unread,is_group,archived,pinned,muted_until,last_status)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
                      ON CONFLICT(jid) DO UPDATE SET
                        name=CASE WHEN excluded.name<>'' THEN excluded.name ELSE chats.name END,
                        is_group=excluded.is_group,
@@ -119,6 +173,8 @@ impl Store {
                                          THEN excluded.last_message ELSE chats.last_message END,
                        last_from_me=CASE WHEN excluded.last_ts>=chats.last_ts
                                          THEN excluded.last_from_me ELSE chats.last_from_me END,
+                       last_status=CASE WHEN excluded.last_ts>=chats.last_ts
+                                        THEN excluded.last_status ELSE chats.last_status END,
                        last_ts=MAX(excluded.last_ts, chats.last_ts)",
                 )?;
                 for r in &rows {
@@ -133,6 +189,7 @@ impl Store {
                         r.archived as i64,
                         r.pinned as i64,
                         r.muted_until,
+                        r.last_status,
                     ])?;
                 }
             }
@@ -170,13 +227,15 @@ impl Store {
     }
 
     /// Apply a single live message (sent or received) to its chat: refresh the
-    /// preview/timestamp and bump unread for incoming messages.
+    /// preview/timestamp/status and bump unread for incoming messages. `status` is
+    /// the delivery state of an outgoing message (0 for incoming).
     pub async fn apply_message(
         &self,
         jid: String,
         text: String,
         ts: i64,
         from_me: bool,
+        status: i32,
     ) -> Result<()> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
@@ -186,18 +245,55 @@ impl Store {
             // We deliberately store an empty name here: the display name is
             // resolved at read time (chat name → contact pushname → number).
             guard.execute(
-                "INSERT INTO chats (jid,name,last_message,last_ts,last_from_me,unread,is_group)
-                 VALUES (?1,'',?2,?3,?4,?5,?6)
+                "INSERT INTO chats (jid,name,last_message,last_ts,last_from_me,unread,is_group,last_status)
+                 VALUES (?1,'',?2,?3,?4,?5,?6,?7)
                  ON CONFLICT(jid) DO UPDATE SET
                    last_message=CASE WHEN excluded.last_ts>=chats.last_ts
                                      THEN excluded.last_message ELSE chats.last_message END,
                    last_from_me=CASE WHEN excluded.last_ts>=chats.last_ts
                                      THEN excluded.last_from_me ELSE chats.last_from_me END,
+                   last_status=CASE WHEN excluded.last_ts>=chats.last_ts
+                                    THEN excluded.last_status ELSE chats.last_status END,
                    last_ts=MAX(excluded.last_ts, chats.last_ts),
                    unread=chats.unread + ?5",
-                params![jid, text, ts, from_me as i64, inc, is_group as i64],
+                params![jid, text, ts, from_me as i64, inc, is_group as i64, status],
             )?;
             Ok(())
+        })
+        .await?
+    }
+
+    /// Upgrades an outgoing message's delivery status (never downgrades), and
+    /// keeps the chat's `last_status` in sync when the updated row is the latest
+    /// message of the chat. Driven by `Event::Receipt`. Returns the number of
+    /// message rows actually changed (0 = no matching/forward-moving row), for
+    /// diagnostics.
+    pub async fn update_message_status(
+        &self,
+        chat_jid: String,
+        id: String,
+        status: i32,
+    ) -> Result<usize> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<usize> {
+            let guard = conn.lock().map_err(|_| anyhow!("store mutex poisoned"))?;
+            // Only ever move forward (sent → delivered → read).
+            let changed = guard.execute(
+                "UPDATE messages SET status=?3
+                 WHERE chat_jid=?1 AND id=?2 AND status<?3",
+                params![chat_jid, id, status],
+            )?;
+            // Reflect on the chat preview if this is the most recent message.
+            guard.execute(
+                "UPDATE chats SET last_status=?2
+                 WHERE jid=?1 AND last_from_me=1
+                   AND last_ts=(SELECT MAX(ts) FROM messages WHERE chat_jid=?1)
+                   AND ?2>last_status
+                   AND ?3=(SELECT id FROM messages
+                           WHERE chat_jid=?1 ORDER BY ts DESC, id DESC LIMIT 1)",
+                params![chat_jid, status, id],
+            )?;
+            Ok(changed)
         })
         .await?
     }
@@ -221,6 +317,52 @@ impl Store {
     /// Convenience: clears a chat's unread counter (marks it read).
     pub async fn clear_unread(&self, jid: String) -> Result<()> {
         self.set_unread(jid, 0).await
+    }
+
+    /// Records a learned LID↔PN pair (both full JIDs). Ignored unless `lid` is an
+    /// `@lid` JID and `pn` an `@s.whatsapp.net` JID.
+    pub async fn learn_lid_pn(&self, lid: String, pn: String) -> Result<()> {
+        if !lid.ends_with("@lid") || !pn.ends_with("@s.whatsapp.net") {
+            return Ok(());
+        }
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let guard = conn.lock().map_err(|_| anyhow!("store mutex poisoned"))?;
+            guard.execute(
+                "INSERT INTO lid_map (lid, pn) VALUES (?1, ?2)
+                 ON CONFLICT(lid) DO UPDATE SET pn=excluded.pn",
+                params![lid, pn],
+            )?;
+            Ok(())
+        })
+        .await?
+    }
+
+    /// Re-keys app-state metadata that landed on an `@lid` JID onto the PN form of
+    /// the same contact, using the learned [`lid_map`]. App-state archive/pin
+    /// events arrive as `@lid` while 1:1 chats are keyed by PN, so without this the
+    /// flags never match the chat row. The `@lid` value is authoritative (it is the
+    /// event's own key). Returns the number of PN rows written, for diagnostics.
+    pub async fn propagate_lid_meta(&self) -> Result<usize> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<usize> {
+            let guard = conn.lock().map_err(|_| anyhow!("store mutex poisoned"))?;
+            let n = guard.execute(
+                "INSERT INTO chat_meta (jid, archived, pinned, muted_until, saved_name)
+                 SELECT lm.pn, m.archived, m.pinned, m.muted_until, m.saved_name
+                 FROM chat_meta m JOIN lid_map lm ON lm.lid = m.jid
+                 WHERE m.jid LIKE '%@lid'
+                 ON CONFLICT(jid) DO UPDATE SET
+                   archived=excluded.archived,
+                   pinned=excluded.pinned,
+                   muted_until=excluded.muted_until,
+                   saved_name=CASE WHEN excluded.saved_name<>''
+                                   THEN excluded.saved_name ELSE chat_meta.saved_name END",
+                [],
+            )?;
+            Ok(n)
+        })
+        .await?
     }
 
     /// Sets the saved (address-book) name for a chat, from a `ContactAction`.
@@ -320,7 +462,7 @@ impl Store {
                 "SELECT c.jid,
                         COALESCE(NULLIF(c.name,''), NULLIF(m.saved_name,''), NULLIF(ct.name,''), '') AS name,
                         c.last_message, c.last_ts, c.last_from_me, c.unread, c.is_group,
-                        COALESCE(m.pinned,0) AS pinned
+                        COALESCE(m.pinned,0) AS pinned, c.last_status
                  FROM chats c
                  LEFT JOIN contacts ct ON ct.jid = c.jid
                  LEFT JOIN chat_meta m ON m.jid = c.jid
@@ -346,6 +488,7 @@ impl Store {
                         unread: r.get::<_, i64>(5)? as u32,
                         is_group: r.get::<_, i64>(6)? != 0,
                         pinned: r.get::<_, i64>(7)? != 0,
+                        last_status: r.get::<_, i64>(8)? as i32,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -365,10 +508,15 @@ impl Store {
             let mut guard = conn.lock().map_err(|_| anyhow!("store mutex poisoned"))?;
             let tx = guard.transaction()?;
             {
+                // Keep existing rows, but let a re-sync UPGRADE the delivery
+                // status (never regress it) — older imports stored status 0
+                // before the column existed.
                 let mut stmt = tx.prepare(
-                    "INSERT OR IGNORE INTO messages
-                       (chat_jid,id,sender_jid,from_me,ts,body)
-                     VALUES (?1,?2,?3,?4,?5,?6)",
+                    "INSERT INTO messages
+                       (chat_jid,id,sender_jid,from_me,ts,body,status)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7)
+                     ON CONFLICT(chat_jid,id) DO UPDATE SET
+                       status=MAX(messages.status, excluded.status)",
                 )?;
                 for m in &rows {
                     stmt.execute(params![
@@ -377,7 +525,8 @@ impl Store {
                         m.sender_jid,
                         m.from_me as i64,
                         m.ts,
-                        m.body
+                        m.body,
+                        m.status
                     ])?;
                 }
             }
@@ -393,15 +542,16 @@ impl Store {
         tokio::task::spawn_blocking(move || -> Result<()> {
             let guard = conn.lock().map_err(|_| anyhow!("store mutex poisoned"))?;
             guard.execute(
-                "INSERT OR IGNORE INTO messages (chat_jid,id,sender_jid,from_me,ts,body)
-                 VALUES (?1,?2,?3,?4,?5,?6)",
+                "INSERT OR IGNORE INTO messages (chat_jid,id,sender_jid,from_me,ts,body,status)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7)",
                 params![
                     m.chat_jid,
                     m.id,
                     m.sender_jid,
                     m.from_me as i64,
                     m.ts,
-                    m.body
+                    m.body,
+                    m.status
                 ],
             )?;
             Ok(())
@@ -420,9 +570,9 @@ impl Store {
             let mut stmt = guard.prepare(
                 "SELECT x.id, x.sender_jid,
                         COALESCE(NULLIF(cm.saved_name,''), NULLIF(ct.name,''), '') AS sender_name,
-                        x.from_me, x.ts, x.body
+                        x.from_me, x.ts, x.body, x.status
                  FROM (
-                   SELECT id, sender_jid, from_me, ts, body
+                   SELECT id, sender_jid, from_me, ts, body, status
                    FROM messages WHERE chat_jid=?1
                    ORDER BY ts DESC, id DESC LIMIT ?2
                  ) x
@@ -440,6 +590,7 @@ impl Store {
                         from_me: r.get::<_, i64>(3)? != 0,
                         ts: r.get(4)?,
                         body: r.get(5)?,
+                        status: r.get::<_, i64>(6)? as i32,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -466,9 +617,9 @@ impl Store {
             let mut stmt = guard.prepare(
                 "SELECT x.id, x.sender_jid,
                         COALESCE(NULLIF(cm.saved_name,''), NULLIF(ct.name,''), '') AS sender_name,
-                        x.from_me, x.ts, x.body
+                        x.from_me, x.ts, x.body, x.status
                  FROM (
-                   SELECT id, sender_jid, from_me, ts, body
+                   SELECT id, sender_jid, from_me, ts, body, status
                    FROM messages
                    WHERE chat_jid=?1 AND (ts < ?2 OR (ts = ?2 AND id < ?3))
                    ORDER BY ts DESC, id DESC LIMIT ?4
@@ -487,6 +638,7 @@ impl Store {
                         from_me: r.get::<_, i64>(3)? != 0,
                         ts: r.get(4)?,
                         body: r.get(5)?,
+                        status: r.get::<_, i64>(6)? as i32,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
