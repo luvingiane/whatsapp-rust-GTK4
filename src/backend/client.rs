@@ -13,6 +13,7 @@ use log::{error, info, warn};
 use tokio::sync::Notify;
 use wacore::store::DevicePropsOverride;
 use wacore::types::events::Event;
+use wacore::types::presence::ReceiptType;
 use whatsapp_rust::bot::Bot;
 use whatsapp_rust::client::Client;
 use whatsapp_rust::waproto::whatsapp as wa;
@@ -117,45 +118,71 @@ pub async fn run(
     let mut handle = bot.spawn();
     info!("WhatsApp backend run loop started");
 
-    // One-shot LID↔PN reconcile: app-state events arrive with `@lid` keys while
-    // chats are keyed by phone number, so saved names / archive landed on keys
-    // that don't match. Re-key every chat_meta entry under all its JID forms
-    // (resolved from whatsapp.db — no re-pair needed). Runs in the background.
+    // Periodic LID↔PN reconcile. App-state events (archive/pin/saved-name) arrive
+    // with `@lid` keys while 1:1 chats are keyed by phone number, so the flags land
+    // on a key that doesn't match the chat row. We (a) re-key each chat_meta entry
+    // under every JID form the library knows, and (b) re-key `@lid` metadata onto
+    // the PN form via the `lid_map` we learn from ContactUpdate/messages. The
+    // LID↔PN knowledge fills over time (usync, incoming messages), so we re-run
+    // for the first few minutes after connect rather than once.
     {
         let client = handle.client();
         let store = store.clone();
         let dirty = dirty.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(5)).await;
-            let rows = match store.all_chat_meta().await {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!("reconcile: all_chat_meta failed: {e:?}");
-                    return;
-                }
+            // Explicitly resolve @lid → PN for archived chats via a batched usync:
+            // `get_user_info` persists the LID↔PN pairs into the library map, which
+            // `jid_forms` then uses to re-key the archive flag onto the PN chat row.
+            // Passive learning (ContactUpdate/messages) never covers archived
+            // contacts we don't open, so without this they leak into the main list.
+            let lids: Vec<whatsapp_rust::Jid> = match store.all_chat_meta().await {
+                Ok(rows) => rows
+                    .into_iter()
+                    .filter(|(j, archived, ..)| *archived && j.ends_with("@lid"))
+                    .filter_map(|(j, ..)| j.parse().ok())
+                    .collect(),
+                Err(_) => Vec::new(),
             };
-            let mut unified = 0u32;
-            for (jid_str, archived, _pinned, _muted, saved) in rows {
-                let Ok(jid) = jid_str.parse::<whatsapp_rust::Jid>() else {
-                    continue;
-                };
-                let forms = jid_forms(&client, &jid).await;
-                if forms.len() < 2 {
-                    continue; // no alternate form to unify under
-                }
-                for key in forms {
-                    if archived {
-                        let _ = store.set_archived(key.clone(), true).await;
-                    }
-                    if !saved.is_empty() {
-                        let _ = store.set_saved_name(key, saved.clone()).await;
+            if !lids.is_empty() {
+                info!("usync: resolving {} archived @lid JIDs", lids.len());
+                for chunk in lids.chunks(50) {
+                    if let Err(e) = client.contacts().get_user_info(chunk).await {
+                        warn!("get_user_info (lid resolve) failed: {e:?}");
                     }
                 }
-                unified += 1;
             }
-            if unified > 0 {
-                info!("LID<->PN reconcile: unified {unified} chat_meta entries");
-                dirty.notify_one();
+            // ~10 minutes of catch-up (20 × 30s); live events keep it fresh after.
+            for _ in 0..20 {
+                let mut unified = 0u32;
+                if let Ok(rows) = store.all_chat_meta().await {
+                    for (jid_str, archived, _pinned, _muted, saved) in rows {
+                        let Ok(jid) = jid_str.parse::<whatsapp_rust::Jid>() else {
+                            continue;
+                        };
+                        let forms = jid_forms(&client, &jid).await;
+                        if forms.len() < 2 {
+                            continue;
+                        }
+                        for key in forms {
+                            if archived {
+                                let _ = store.set_archived(key.clone(), true).await;
+                            }
+                            if !saved.is_empty() {
+                                let _ = store.set_saved_name(key, saved.clone()).await;
+                            }
+                        }
+                        unified += 1;
+                    }
+                }
+                let propagated = store.propagate_lid_meta().await.unwrap_or(0);
+                if unified > 0 || propagated > 0 {
+                    info!(
+                        "LID<->PN reconcile: {unified} via library map, {propagated} via lid_map"
+                    );
+                    dirty.notify_one();
+                }
+                tokio::time::sleep(Duration::from_secs(30)).await;
             }
         });
     }
@@ -408,7 +435,12 @@ async fn handle_event(
                     }
                 }
                 if !msgs.is_empty() {
-                    info!("history sync: storing {} messages", msgs.len());
+                    let from_me = msgs.iter().filter(|m| m.from_me).count();
+                    let with_status = msgs.iter().filter(|m| m.status >= 2).count();
+                    info!(
+                        "history sync: storing {} messages ({from_me} ours, {with_status} already ✓✓/read)",
+                        msgs.len()
+                    );
                     if let Err(e) = store.insert_messages(msgs).await {
                         warn!("insert_messages failed: {e:?}");
                     }
@@ -421,6 +453,12 @@ async fn handle_event(
             // the list/open thread (fixes live updates for LID-addressed chats).
             let chat = canonical_chat_jid(&client, &info.source.chat).await;
             if is_user_chat(&chat) {
+                // Learn LID↔PN from the message's primary/alt JIDs (peers are
+                // addressed by one form with the other in *_alt).
+                learn_alt(&store, &info.source.sender, info.source.sender_alt.as_ref()).await;
+                if let Some(rcpt) = &info.source.recipient {
+                    learn_alt(&store, rcpt, info.source.recipient_alt.as_ref()).await;
+                }
                 // Learn the sender's pushname from incoming messages.
                 if !info.source.is_from_me && !info.push_name.is_empty() {
                     let sender = info.source.sender.to_string();
@@ -438,8 +476,15 @@ async fn handle_event(
                 if !body.is_empty() {
                     let ts = info.timestamp.timestamp();
                     let from_me = info.source.is_from_me;
+                    // Our own live message is at least server-acked → one tick;
+                    // incoming messages carry no status.
+                    let status = if from_me { 1 } else { 0 };
+                    info!(
+                        "message: from_me={from_me} status={status} id={} chat={chat}",
+                        info.id
+                    );
                     if let Err(e) = store
-                        .apply_message(chat.clone(), body.clone(), ts, from_me)
+                        .apply_message(chat.clone(), body.clone(), ts, from_me, status)
                         .await
                     {
                         warn!("apply_message failed: {e:?}");
@@ -458,6 +503,7 @@ async fn handle_event(
                         from_me,
                         ts,
                         body,
+                        status,
                     };
                     if let Err(e) = store.insert_message(row.clone()).await {
                         warn!("insert_message failed: {e:?}");
@@ -471,11 +517,15 @@ async fn handle_event(
         // address-book name. JIDs may be LID-form, so normalize to the chat key.
         Event::ArchiveUpdate(a) => {
             let archived = a.action.archived.unwrap_or(false);
+            info!("archive: jid={} archived={archived}", a.jid);
             for jid in jid_forms(&client, &a.jid).await {
                 if let Err(e) = store.set_archived(jid, archived).await {
                     warn!("set_archived failed: {e:?}");
                 }
             }
+            // Re-key onto the PN chat row immediately if we already learned the
+            // @lid↔PN pair (the library map is often empty right after pairing).
+            let _ = store.propagate_lid_meta().await;
             dirty.notify_one();
         }
         Event::PinUpdate(p) => {
@@ -498,6 +548,16 @@ async fn handle_event(
             dirty.notify_one();
         }
         Event::ContactUpdate(c) => {
+            // ContactAction carries both JID forms explicitly — the most reliable
+            // LID↔PN pair we get. Learn it so app-state archive flags (keyed @lid)
+            // can be re-keyed onto the PN chat row.
+            if let (Some(pn), Some(lid)) = (&c.action.pn_jid, &c.action.lid_jid) {
+                if !pn.is_empty() && !lid.is_empty() {
+                    if let Err(e) = store.learn_lid_pn(lid.clone(), pn.clone()).await {
+                        warn!("learn_lid_pn failed: {e:?}");
+                    }
+                }
+            }
             let name = c
                 .action
                 .full_name
@@ -531,6 +591,7 @@ async fn handle_event(
         // badge. `read=Some(true)` clears it; `Some(false)` marks unread. Keyed
         // under every JID form so it matches the chat row (PN) like archive does.
         Event::MarkChatAsReadUpdate(u) => {
+            info!("mark-read: jid={} read={:?}", u.jid, u.action.read);
             match u.action.read {
                 Some(true) => {
                     for jid in jid_forms(&client, &u.jid).await {
@@ -550,7 +611,72 @@ async fn handle_event(
             }
             dirty.notify_one();
         }
+        // Delivery/read receipt for one or more of OUR sent messages. Advance
+        // their stored status and tell the UI so open bubbles update live.
+        Event::Receipt(r) => {
+            info!(
+                "receipt: type={:?} offline={} ids={} chat={}",
+                r.r#type,
+                r.offline,
+                r.message_ids.len(),
+                r.source.chat
+            );
+            if let Some(status) = receipt_status(&r.r#type) {
+                let chat = canonical_chat_jid(&client, &r.source.chat).await;
+                let mut changed = 0usize;
+                for id in &r.message_ids {
+                    match store
+                        .update_message_status(chat.clone(), id.clone(), status)
+                        .await
+                    {
+                        Ok(n) => changed += n,
+                        Err(e) => warn!("update_message_status failed: {e:?}"),
+                    }
+                }
+                info!(
+                    "receipt applied: status={status} chat={chat} matched={changed}/{} ids",
+                    r.message_ids.len()
+                );
+                let _ = tx
+                    .send(WaEvent::ReceiptUpdate {
+                        chat_jid: chat,
+                        message_ids: r.message_ids.clone(),
+                        status,
+                    })
+                    .await;
+                dirty.notify_one();
+            } else {
+                info!("receipt ignored (type does not advance ticks)");
+            }
+        }
         _ => {}
+    }
+}
+
+/// Maps a WhatsApp receipt type to our delivery-status scale (1 sent, 2
+/// delivered, 3 read/played). Returns `None` for receipt kinds that don't
+/// advance an outgoing message's ticks (retries, self-read, inactive, …).
+fn receipt_status(t: &ReceiptType) -> Option<i32> {
+    match t {
+        ReceiptType::Sent => Some(1),
+        ReceiptType::Delivered => Some(2),
+        ReceiptType::Read | ReceiptType::Played => Some(3),
+        _ => None,
+    }
+}
+
+/// Maps a synced `WebMessageInfo` status to our scale, for our own messages
+/// (incoming messages carry no ticks → 0). Unknown/pending for an outgoing
+/// message still shows one tick (it was at least handed to the server).
+fn wmi_local_status(wmi: &wa::WebMessageInfo, from_me: bool) -> i32 {
+    if !from_me {
+        return 0;
+    }
+    use wa::web_message_info::Status as S;
+    match wmi.status() {
+        S::DeliveryAck => 2,
+        S::Read | S::Played => 3,
+        _ => 1,
     }
 }
 
@@ -560,6 +686,23 @@ async fn handle_event(
 /// arrive keyed by `@lid` while our chats are keyed `@s.whatsapp.net`; writing
 /// metadata under every form lets both 1:1 chats (PN) and group senders (LID)
 /// resolve it. Group/PN JIDs with no mapping simply return just themselves.
+/// Learns a LID↔PN pair from a message source's primary and alternate JIDs, when
+/// one is an `@lid` JID and the other a phone-number JID.
+async fn learn_alt(store: &Store, a: &whatsapp_rust::Jid, b: Option<&whatsapp_rust::Jid>) {
+    let Some(b) = b else { return };
+    let (a, b) = (a.to_string(), b.to_string());
+    let (lid, pn) = if a.ends_with("@lid") && b.ends_with("@s.whatsapp.net") {
+        (a, b)
+    } else if b.ends_with("@lid") && a.ends_with("@s.whatsapp.net") {
+        (b, a)
+    } else {
+        return;
+    };
+    if let Err(e) = store.learn_lid_pn(lid, pn).await {
+        warn!("learn_lid_pn (msg) failed: {e:?}");
+    }
+}
+
 async fn jid_forms(client: &Client, jid: &whatsapp_rust::Jid) -> Vec<String> {
     let mut forms = vec![jid.to_string()];
     if let Ok(Some(e)) = client.get_lid_pn_entry(jid).await {
@@ -622,7 +765,7 @@ fn conv_to_upsert(c: &wa::Conversation, jid: &str) -> Option<ChatUpsert> {
         .filter(|s| !s.is_empty())
         .unwrap_or_default();
 
-    let (last_message, msg_ts, last_from_me) = latest_message(c);
+    let (last_message, msg_ts, last_from_me, last_status) = latest_message(c);
     // Order by the real last content message. Fall back to the conversation's own
     // `last_msg_timestamp`, but NOT `conversation_timestamp` — WhatsApp bumps the
     // latter for non-message activity, which made stale chats look recent.
@@ -634,6 +777,7 @@ fn conv_to_upsert(c: &wa::Conversation, jid: &str) -> Option<ChatUpsert> {
         last_message,
         last_ts,
         last_from_me,
+        last_status,
         unread: c.unread_count.unwrap_or(0),
         is_group,
         archived: c.archived.unwrap_or(false),
@@ -665,26 +809,29 @@ fn conv_to_messages(c: &wa::Conversation, chat: &str) -> Vec<MessageRow> {
                 .participant
                 .clone()
                 .unwrap_or_else(|| chat.to_string());
+            let from_me = wmi.key.from_me.unwrap_or(false);
             Some(MessageRow {
                 id,
                 chat_jid: chat.to_string(),
                 sender_jid,
                 // Resolved at read time (store::load_messages JOIN).
                 sender_name: String::new(),
-                from_me: wmi.key.from_me.unwrap_or(false),
+                from_me,
                 ts: wmi.message_timestamp.unwrap_or(0) as i64,
                 body,
+                // Delivery status from the synced WebMessageInfo (our msgs only).
+                status: wmi_local_status(wmi, from_me),
             })
         })
         .collect()
 }
 
 /// Finds the most recent message **with displayable content** and returns its
-/// preview text, timestamp and direction. System/protocol/empty messages are
-/// skipped: counting them made stale chats show a recent date with no preview
-/// (e.g. a security-code-change notification on a years-old conversation).
-fn latest_message(c: &wa::Conversation) -> (String, Option<u64>, bool) {
-    let mut best: Option<(u64, String, bool)> = None;
+/// preview text, timestamp, direction and (for our own) delivery status. System/
+/// protocol/empty messages are skipped: counting them made stale chats show a
+/// recent date with no preview (e.g. a security-code-change notification).
+fn latest_message(c: &wa::Conversation) -> (String, Option<u64>, bool, i32) {
+    let mut best: Option<(u64, String, bool, i32)> = None;
     for hm in &c.messages {
         let Some(wmi) = &hm.message else { continue };
         let Some(msg) = &wmi.message else { continue };
@@ -693,12 +840,13 @@ fn latest_message(c: &wa::Conversation) -> (String, Option<u64>, bool) {
             continue;
         }
         let ts = wmi.message_timestamp.unwrap_or(0);
-        if best.as_ref().map_or(true, |(best_ts, _, _)| *best_ts <= ts) {
-            best = Some((ts, preview, wmi.key.from_me.unwrap_or(false)));
+        if best.as_ref().map_or(true, |(best_ts, ..)| *best_ts <= ts) {
+            let from_me = wmi.key.from_me.unwrap_or(false);
+            best = Some((ts, preview, from_me, wmi_local_status(wmi, from_me)));
         }
     }
     match best {
-        Some((ts, preview, from_me)) => (preview, Some(ts), from_me),
-        None => (String::new(), None, false),
+        Some((ts, preview, from_me, status)) => (preview, Some(ts), from_me, status),
+        None => (String::new(), None, false, 0),
     }
 }

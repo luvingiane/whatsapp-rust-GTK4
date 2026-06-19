@@ -26,6 +26,12 @@ mod imp {
         pub timestamp: RefCell<String>,
         #[property(get, set)]
         pub unread: Cell<u32>,
+        // Whether the last message was ours (drives the ✓/✓✓ preview prefix).
+        #[property(get, set)]
+        pub last_from_me: Cell<bool>,
+        // Delivery status of our last message (1 sent, 2 delivered, 3 read).
+        #[property(get, set)]
+        pub last_status: Cell<i32>,
         // Profile-picture paintable (a `gdk::Texture`), bound to the row's
         // Avatar `custom-image`; `None` until the picture has been downloaded.
         #[property(get, set, nullable)]
@@ -54,6 +60,8 @@ impl ChatObject {
             .property("last-message", &s.last_message)
             .property("timestamp", format_ts(s.last_ts))
             .property("unread", s.unread)
+            .property("last-from-me", s.last_from_me)
+            .property("last-status", s.last_status)
             .build()
     }
 }

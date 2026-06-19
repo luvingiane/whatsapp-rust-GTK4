@@ -43,6 +43,9 @@ pub struct ThreadView {
     senders: Rc<RefCell<HashMap<String, Vec<adw::Avatar>>>>,
     /// Invoked with a sender JID when a group bubble still lacks its avatar.
     on_need_avatar: NeedAvatarCb,
+    /// Our sent message id → its ✓/✓✓ status label, so a later receipt updates
+    /// the glyph in place. Cleared when the thread is cleared.
+    ticks: Rc<RefCell<HashMap<String, gtk::Label>>>,
 }
 
 impl ThreadView {
@@ -97,6 +100,7 @@ impl ThreadView {
             avatars: avatars.clone(),
             senders: Rc::new(RefCell::new(HashMap::new())),
             on_need_avatar: Rc::new(RefCell::new(None)),
+            ticks: Rc::new(RefCell::new(HashMap::new())),
         }
     }
 
@@ -187,6 +191,20 @@ impl ThreadView {
         self.loading_older.set(false);
         self.exhausted.set(false);
         self.senders.borrow_mut().clear();
+        self.ticks.borrow_mut().clear();
+    }
+
+    /// Advances the ✓/✓✓ glyph of one of our sent bubbles when a receipt lands
+    /// (no-op if that message isn't currently on screen).
+    pub fn set_status(&self, id: &str, status: i32) {
+        if let Some(tick) = self.ticks.borrow().get(id) {
+            tick.set_label(status_glyph(status));
+            if status >= 3 {
+                tick.add_css_class("tick-read");
+            } else {
+                tick.remove_css_class("tick-read");
+            }
+        }
     }
 
     fn bubble(&self, m: &MessageRow) -> gtk::Box {
@@ -231,7 +249,27 @@ impl ThreadView {
             .build();
         time.add_css_class("caption");
         time.add_css_class("dim-label");
-        bubble.append(&time);
+
+        if m.from_me {
+            // Time + delivery ticks on one right-aligned row; the tick label is
+            // tracked by message id so a later receipt can update it in place.
+            let tick = gtk::Label::new(Some(status_glyph(m.status)));
+            tick.add_css_class("tick");
+            if m.status >= 3 {
+                tick.add_css_class("tick-read");
+            }
+            self.ticks.borrow_mut().insert(m.id.clone(), tick.clone());
+            let row = gtk::Box::builder()
+                .orientation(gtk::Orientation::Horizontal)
+                .spacing(4)
+                .halign(gtk::Align::End)
+                .build();
+            row.append(&time);
+            row.append(&tick);
+            bubble.append(&row);
+        } else {
+            bubble.append(&time);
+        }
 
         // In groups, show the sender's avatar to the left of incoming bubbles.
         if self.is_group.get() && !m.from_me && !m.sender_jid.is_empty() {
@@ -273,6 +311,16 @@ impl ThreadView {
         glib::idle_add_local_once(move || {
             vadj.set_value(vadj.upper() - vadj.page_size());
         });
+    }
+}
+
+/// The check glyph for an outgoing message's delivery status: 1 sent (✓), 2
+/// delivered and 3 read (✓✓ — colour distinguishes read). 0/other → none.
+fn status_glyph(status: i32) -> &'static str {
+    match status {
+        1 => "✓",
+        2 | 3 => "✓✓",
+        _ => "",
     }
 }
 
