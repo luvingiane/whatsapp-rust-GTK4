@@ -4,6 +4,7 @@
 //! persist the session to SQLite so restarts reconnect without re-scanning.
 
 mod app;
+mod audio;
 mod backend;
 mod config;
 mod model;

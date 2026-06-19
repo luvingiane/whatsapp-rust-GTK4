@@ -12,6 +12,7 @@ use gtk::glib;
 use libadwaita as adw;
 
 use super::AvatarCache;
+use crate::audio::Recorder;
 use crate::model::MessageRow;
 use crate::util::preview;
 
@@ -20,10 +21,15 @@ const BACKFILL_THRESHOLD: f64 = 40.0;
 
 type LoadOlderCb = Box<dyn Fn(i64, String)>;
 type NeedAvatarCb = Rc<RefCell<Option<Box<dyn Fn(String)>>>>;
+type SendCb = Rc<RefCell<Option<Box<dyn Fn(String)>>>>;
+type SendAudioCb = Rc<RefCell<Option<Box<dyn Fn(Vec<u8>, u32)>>>>;
 
 #[derive(Clone)]
 pub struct ThreadView {
-    pub root: gtk::ScrolledWindow,
+    /// Outer container: the scrolled message list above a composer bar.
+    pub root: gtk::Box,
+    /// The scrolled message list (drives backfill via its vadjustment).
+    scrolled: gtk::ScrolledWindow,
     list: gtk::Box,
     /// Whether the open chat is a group (drives the per-message sender label).
     is_group: Rc<Cell<bool>>,
@@ -46,6 +52,10 @@ pub struct ThreadView {
     /// Our sent message id → its ✓/✓✓ status label, so a later receipt updates
     /// the glyph in place. Cleared when the thread is cleared.
     ticks: Rc<RefCell<HashMap<String, gtk::Label>>>,
+    /// Invoked with the composed text when the user sends a message.
+    on_send: SendCb,
+    /// Invoked with `(ogg_bytes, duration_secs)` when a voice note is recorded.
+    on_send_audio: SendAudioCb,
 }
 
 impl ThreadView {
@@ -59,7 +69,7 @@ impl ThreadView {
             .margin_end(12)
             .build();
 
-        let root = gtk::ScrolledWindow::builder()
+        let scrolled = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
             .vexpand(true)
             .child(&list)
@@ -76,7 +86,7 @@ impl ThreadView {
             let loading_older = loading_older.clone();
             let exhausted = exhausted.clone();
             let on_load_older = on_load_older.clone();
-            root.vadjustment().connect_value_changed(move |adj| {
+            scrolled.vadjustment().connect_value_changed(move |adj| {
                 if adj.value() > BACKFILL_THRESHOLD || loading_older.get() || exhausted.get() {
                     return;
                 }
@@ -89,8 +99,97 @@ impl ThreadView {
             });
         }
 
+        // --- composer: text entry + mic + send --------------------------------
+        let on_send: SendCb = Rc::new(RefCell::new(None));
+        let on_send_audio: SendAudioCb = Rc::new(RefCell::new(None));
+        let recorder: Rc<RefCell<Option<Recorder>>> = Rc::new(RefCell::new(None));
+
+        let entry = gtk::Entry::builder()
+            .hexpand(true)
+            .placeholder_text("Scrivi un messaggio")
+            .build();
+        let mic = gtk::Button::from_icon_name("audio-input-microphone-symbolic");
+        mic.add_css_class("flat");
+        let send = gtk::Button::from_icon_name("document-send-symbolic");
+        send.add_css_class("suggested-action");
+
+        // Send on Enter or on the Send button; ignore blank input.
+        let do_send = {
+            let entry = entry.clone();
+            let on_send = on_send.clone();
+            move || {
+                let text = entry.text().to_string();
+                if text.trim().is_empty() {
+                    return;
+                }
+                if let Some(cb) = on_send.borrow().as_ref() {
+                    cb(text);
+                }
+                entry.set_text("");
+            }
+        };
+        {
+            let do_send = do_send.clone();
+            entry.connect_activate(move |_| do_send());
+        }
+        {
+            let do_send = do_send.clone();
+            send.connect_clicked(move |_| do_send());
+        }
+
+        // Mic button toggles a voice-note recording; the second tap stops & sends.
+        {
+            let recorder = recorder.clone();
+            let on_send_audio = on_send_audio.clone();
+            let mic_btn = mic.clone();
+            mic.connect_clicked(move |_| {
+                let recording = recorder.borrow().is_some();
+                if recording {
+                    let rec = recorder.borrow_mut().take();
+                    mic_btn.remove_css_class("destructive-action");
+                    mic_btn.set_icon_name("audio-input-microphone-symbolic");
+                    if let Some(rec) = rec {
+                        match rec.stop() {
+                            Ok((ogg, secs)) => {
+                                if let Some(cb) = on_send_audio.borrow().as_ref() {
+                                    cb(ogg, secs);
+                                }
+                            }
+                            Err(e) => log::warn!("voice note failed: {e:?}"),
+                        }
+                    }
+                } else {
+                    match Recorder::start() {
+                        Ok(rec) => {
+                            *recorder.borrow_mut() = Some(rec);
+                            mic_btn.add_css_class("destructive-action");
+                            mic_btn.set_icon_name("media-playback-stop-symbolic");
+                        }
+                        Err(e) => log::warn!("cannot start recording: {e:?}"),
+                    }
+                }
+            });
+        }
+
+        let composer = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(6)
+            .margin_top(6)
+            .margin_bottom(6)
+            .margin_start(6)
+            .margin_end(6)
+            .build();
+        composer.append(&entry);
+        composer.append(&mic);
+        composer.append(&send);
+
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        root.append(&scrolled);
+        root.append(&composer);
+
         Self {
             root,
+            scrolled,
             list,
             is_group: Rc::new(Cell::new(false)),
             oldest,
@@ -101,7 +200,20 @@ impl ThreadView {
             senders: Rc::new(RefCell::new(HashMap::new())),
             on_need_avatar: Rc::new(RefCell::new(None)),
             ticks: Rc::new(RefCell::new(HashMap::new())),
+            on_send,
+            on_send_audio,
         }
+    }
+
+    /// Registers the callback invoked with the composed text when the user sends.
+    pub fn connect_send<F: Fn(String) + 'static>(&self, f: F) {
+        *self.on_send.borrow_mut() = Some(Box::new(f));
+    }
+
+    /// Registers the callback invoked with `(ogg_bytes, duration_secs)` for a
+    /// recorded voice note.
+    pub fn connect_send_audio<F: Fn(Vec<u8>, u32) + 'static>(&self, f: F) {
+        *self.on_send_audio.borrow_mut() = Some(Box::new(f));
     }
 
     /// Prepare for a freshly opened chat: clear bubbles and record group-ness.
@@ -134,7 +246,7 @@ impl ThreadView {
 
         // Record the scroll geometry before inserting, so we can compensate for
         // the height added above the current viewport.
-        let vadj = self.root.vadjustment();
+        let vadj = self.scrolled.vadjustment();
         let old_value = vadj.value();
         let old_upper = vadj.upper();
 
@@ -307,7 +419,7 @@ impl ThreadView {
 
     fn scroll_to_bottom(&self) {
         // Defer until after layout so `upper` reflects the new content.
-        let vadj = self.root.vadjustment();
+        let vadj = self.scrolled.vadjustment();
         glib::idle_add_local_once(move || {
             vadj.set_value(vadj.upper() - vadj.page_size());
         });

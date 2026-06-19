@@ -88,6 +88,16 @@ pub enum WaCommand {
     /// `false` = unavailable (unfocused or idle). When we never go unavailable the
     /// phone treats this device as active and withholds its own notifications.
     SetPresence { available: bool },
+    /// Send a text message to `jid`. The backend inserts it optimistically and
+    /// replies with [`WaEvent::NewMessage`].
+    SendText { jid: String, text: String },
+    /// Send a voice note (OGG/Opus bytes, `duration` seconds) to `jid`. The backend
+    /// uploads it, sends an audio message (ptt), and replies with a NewMessage.
+    SendAudio {
+        jid: String,
+        ogg: Vec<u8>,
+        duration: u32,
+    },
     /// Ask the backend to stop its run loop (sent when the window closes).
     Shutdown,
 }
