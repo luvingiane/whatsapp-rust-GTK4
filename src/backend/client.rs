@@ -61,21 +61,27 @@ pub async fn run(
         let tx = event_tx.clone();
         let dirty = dirty.clone();
         tokio::spawn(async move {
-            match store.list_chats().await {
-                Ok(chats) => {
-                    let _ = tx.send(WaEvent::ChatsSnapshot(chats)).await;
-                }
-                Err(e) => warn!("initial list_chats failed: {e:?}"),
-            }
-            loop {
-                dirty.notified().await;
-                tokio::time::sleep(SNAPSHOT_DEBOUNCE).await;
+            // Push both the active and the archived lists so the sidebar and the
+            // archived view (with its count) always reflect the same store state.
+            async fn push_snapshots(store: &Store, tx: &Sender<WaEvent>) {
                 match store.list_chats().await {
                     Ok(chats) => {
                         let _ = tx.send(WaEvent::ChatsSnapshot(chats)).await;
                     }
                     Err(e) => warn!("list_chats failed: {e:?}"),
                 }
+                match store.list_archived_chats().await {
+                    Ok(chats) => {
+                        let _ = tx.send(WaEvent::ArchivedChatsSnapshot(chats)).await;
+                    }
+                    Err(e) => warn!("list_archived_chats failed: {e:?}"),
+                }
+            }
+            push_snapshots(&store, &tx).await;
+            loop {
+                dirty.notified().await;
+                tokio::time::sleep(SNAPSHOT_DEBOUNCE).await;
+                push_snapshots(&store, &tx).await;
             }
         });
     }
@@ -168,6 +174,12 @@ pub async fn run(
             }
             cmd = command_rx.recv() => match cmd {
                 Ok(WaCommand::OpenChat(jid)) => {
+                    // Opening a chat reads it: clear its unread badge and refresh
+                    // the list. `jid` is already the canonical chat key.
+                    if let Err(e) = store.clear_unread(jid.clone()).await {
+                        warn!("clear_unread (open) failed: {e:?}");
+                    }
+                    dirty.notify_one();
                     match store.load_messages(jid.clone(), 200).await {
                         Ok(messages) => {
                             let _ = event_tx.send(WaEvent::ChatHistory { jid, messages }).await;
@@ -513,6 +525,30 @@ async fn handle_event(
                 }
                 dirty.notify_one();
             }
+        }
+        // A chat was marked read/unread (here or on the phone), via app-state. We
+        // never decremented `unread` before, so already-read chats kept showing a
+        // badge. `read=Some(true)` clears it; `Some(false)` marks unread. Keyed
+        // under every JID form so it matches the chat row (PN) like archive does.
+        Event::MarkChatAsReadUpdate(u) => {
+            match u.action.read {
+                Some(true) => {
+                    for jid in jid_forms(&client, &u.jid).await {
+                        if let Err(e) = store.clear_unread(jid).await {
+                            warn!("clear_unread failed: {e:?}");
+                        }
+                    }
+                }
+                Some(false) => {
+                    for jid in jid_forms(&client, &u.jid).await {
+                        if let Err(e) = store.set_unread(jid, 1).await {
+                            warn!("set_unread failed: {e:?}");
+                        }
+                    }
+                }
+                None => {}
+            }
+            dirty.notify_one();
         }
         _ => {}
     }

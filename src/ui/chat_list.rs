@@ -17,6 +17,7 @@ use crate::model::ChatSummary;
 const AVATAR_BINDING_KEY: &str = "wrg-avatar-binding";
 
 type NeedAvatarCb = Rc<RefCell<Option<Box<dyn Fn(String)>>>>;
+type OpenArchivedCb = Rc<RefCell<Option<Box<dyn Fn()>>>>;
 
 #[derive(Clone)]
 pub struct ChatList {
@@ -27,10 +28,15 @@ pub struct ChatList {
     avatars: AvatarCache,
     /// Invoked with a JID when a visible row still lacks its avatar.
     on_need_avatar: NeedAvatarCb,
+    /// "Archiviate" entry shown above the list (only on the active list); its
+    /// count label and click callback. `None` on the archived list itself.
+    archived_entry: Option<(gtk::Button, gtk::Label, OpenArchivedCb)>,
 }
 
 impl ChatList {
-    pub fn new(avatars: &AvatarCache) -> Self {
+    /// Builds a chat list. `with_archived_button` adds the "Archiviate" entry on
+    /// top (used for the active list; the archived view passes `false`).
+    pub fn new(avatars: &AvatarCache, with_archived_button: bool) -> Self {
         let store = gio::ListStore::new::<ChatObject>();
         let avatars = avatars.clone();
         let on_need_avatar: NeedAvatarCb = Rc::new(RefCell::new(None));
@@ -130,6 +136,59 @@ impl ChatList {
 
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
         root.append(&search);
+
+        // Optional "Archiviate" entry above the list (WhatsApp-Web style): an
+        // archive icon, the label, and a right-aligned count. Hidden until there
+        // is at least one archived chat. Clicking it opens the archived view.
+        let archived_entry = if with_archived_button {
+            let on_open_archived: OpenArchivedCb = Rc::new(RefCell::new(None));
+            let inner = gtk::Box::builder()
+                .orientation(gtk::Orientation::Horizontal)
+                .spacing(12)
+                .margin_top(6)
+                .margin_bottom(6)
+                .margin_start(6)
+                .margin_end(6)
+                .build();
+            let icon = gtk::Image::from_icon_name("user-trash-symbolic");
+            // A box the size of the list avatars so the label aligns with chat rows.
+            let icon_slot = gtk::Box::builder()
+                .width_request(40)
+                .halign(gtk::Align::Center)
+                .build();
+            icon_slot.append(&icon);
+            let label = gtk::Label::builder()
+                .label("Archiviate")
+                .xalign(0.0)
+                .hexpand(true)
+                .build();
+            label.add_css_class("heading");
+            // Notification badge: number of UNREAD archived chats (not the total).
+            let count = gtk::Label::builder().halign(gtk::Align::End).build();
+            count.add_css_class("badge");
+            count.set_visible(false);
+            inner.append(&icon_slot);
+            inner.append(&label);
+            inner.append(&count);
+
+            let button = gtk::Button::builder().child(&inner).build();
+            button.add_css_class("flat");
+            button.set_visible(false);
+            {
+                let cb = on_open_archived.clone();
+                button.connect_clicked(move |_| {
+                    if let Some(f) = cb.borrow().as_ref() {
+                        f();
+                    }
+                });
+            }
+            root.append(&button);
+            root.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+            Some((button, count, on_open_archived))
+        } else {
+            None
+        };
+
         root.append(&scrolled);
 
         Self {
@@ -138,6 +197,30 @@ impl ChatList {
             list_view,
             avatars,
             on_need_avatar,
+            archived_entry,
+        }
+    }
+
+    /// Updates the "Archiviate" entry: the entry is shown while there are any
+    /// archived chats (`total`), and the badge shows the number of UNREAD archived
+    /// chats (`unread`, hidden when zero). No-op on the archived list itself.
+    pub fn set_archived_count(&self, total: usize, unread: usize) {
+        if let Some((button, count, _)) = &self.archived_entry {
+            button.set_visible(total > 0);
+            if unread > 0 {
+                count.set_label(&unread.to_string());
+                count.set_visible(true);
+            } else {
+                count.set_label("");
+                count.set_visible(false);
+            }
+        }
+    }
+
+    /// Registers the callback invoked when the "Archiviate" entry is clicked.
+    pub fn connect_open_archived<F: Fn() + 'static>(&self, f: F) {
+        if let Some((_, _, cb)) = &self.archived_entry {
+            *cb.borrow_mut() = Some(Box::new(f));
         }
     }
 

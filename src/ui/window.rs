@@ -16,11 +16,18 @@ pub struct MainWindow {
     pub window: adw::ApplicationWindow,
     pub login: LoginView,
     pub chat_list: ChatList,
+    /// The archived-chats list, shown on a pushed sub-page of the sidebar.
+    pub archived_list: ChatList,
     pub thread: ThreadView,
     stack: gtk::Stack,
     content_page: adw::NavigationPage,
     content_stack: gtk::Stack,
     sidebar_title: adw::WindowTitle,
+    /// Sidebar navigation stack: the active list, with the archived list pushed
+    /// on top when the "Archiviate" entry is clicked.
+    sidebar_nav: adw::NavigationView,
+    /// "N chat archiviate" header, shown only inside the archived sub-page.
+    archived_count: gtk::Label,
 }
 
 impl MainWindow {
@@ -34,15 +41,44 @@ impl MainWindow {
         // Shared profile-picture cache, used by the sidebar and the thread.
         let avatars = super::new_avatar_cache();
 
-        // --- sidebar (chat list) ----------------------------------------------
-        let chat_list = ChatList::new(&avatars);
+        // --- sidebar: active list (root) + pushable archived sub-page ----------
+        let chat_list = ChatList::new(&avatars, true);
         let sidebar_tb = adw::ToolbarView::new();
         let sidebar_header = adw::HeaderBar::new();
         let sidebar_title = adw::WindowTitle::new("Chat", "");
         sidebar_header.set_title_widget(Some(&sidebar_title));
         sidebar_tb.add_top_bar(&sidebar_header);
         sidebar_tb.set_content(Some(&chat_list.root));
-        let sidebar_page = adw::NavigationPage::new(&sidebar_tb, "Chat");
+        let chats_page = adw::NavigationPage::new(&sidebar_tb, "Chat");
+        chats_page.set_tag(Some("chats"));
+
+        // Archived sub-page: its own header (back button auto-provided by the
+        // NavigationView), a "N chat archiviate" count line, then the list.
+        let archived_list = ChatList::new(&avatars, false);
+        let archived_header = adw::HeaderBar::new();
+        archived_header.set_title_widget(Some(&adw::WindowTitle::new("Archiviate", "")));
+        let archived_count = gtk::Label::builder()
+            .xalign(0.5)
+            .margin_top(8)
+            .margin_bottom(4)
+            .build();
+        archived_count.add_css_class("dim-label");
+        archived_count.add_css_class("caption");
+        let archived_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        archived_box.append(&archived_count);
+        archived_box.append(&archived_list.root);
+        let archived_tb = adw::ToolbarView::new();
+        archived_tb.add_top_bar(&archived_header);
+        archived_tb.set_content(Some(&archived_box));
+        let archived_page = adw::NavigationPage::new(&archived_tb, "Archiviate");
+        archived_page.set_tag(Some("archived"));
+
+        // The first added page is the visible root; the archived page stays
+        // available for `push_by_tag` but is not shown until requested.
+        let sidebar_nav = adw::NavigationView::new();
+        sidebar_nav.add(&chats_page);
+        sidebar_nav.add(&archived_page);
+        let sidebar_page = adw::NavigationPage::new(&sidebar_nav, "Chat");
 
         // --- content: empty placeholder + conversation thread -----------------
         let empty = adw::StatusPage::builder()
@@ -86,17 +122,44 @@ impl MainWindow {
             window,
             login,
             chat_list,
+            archived_list,
             thread,
             stack,
             content_page,
             content_stack,
             sidebar_title,
+            sidebar_nav,
+            archived_count,
         }
     }
 
     /// Shows our own account number as the sidebar subtitle (empty if unknown).
     pub fn set_account(&self, number: Option<&str>) {
         self.sidebar_title.set_subtitle(number.unwrap_or(""));
+    }
+
+    /// Refreshes the archived list, the "Archiviate" entry (visible while any
+    /// chat is archived; its badge shows the unread count), and the in-page
+    /// "N chat archiviate" header (the total).
+    pub fn update_archived(&self, chats: &[crate::model::ChatSummary]) {
+        let total = chats.len();
+        let unread = chats.iter().filter(|c| c.unread > 0).count();
+        self.archived_list.update(chats);
+        self.chat_list.set_archived_count(total, unread);
+        self.archived_count
+            .set_label(&format!("{total} chat archiviate"));
+    }
+
+    /// Navigates the sidebar to the archived sub-page (no-op if already there).
+    pub fn open_archived(&self) {
+        let on_archived = self
+            .sidebar_nav
+            .visible_page()
+            .and_then(|p| p.tag())
+            .is_some_and(|t| t == "archived");
+        if !on_archived {
+            self.sidebar_nav.push_by_tag("archived");
+        }
     }
 
     /// Show the QR / connection page.

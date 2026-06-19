@@ -58,6 +58,7 @@ fn on_activate(app: &adw::Application) {
     let command_tx = chans.command_tx.clone();
 
     // Selecting a chat: switch the content pane and ask the backend for history.
+    // The active and archived lists share the same open behaviour.
     {
         let win_sel = win.clone();
         let command_tx = command_tx.clone();
@@ -67,6 +68,23 @@ fn on_activate(app: &adw::Application) {
             win_sel.open_chat(&jid, &name);
             let _ = command_tx.try_send(WaCommand::OpenChat(jid));
         });
+    }
+    {
+        let win_sel = win.clone();
+        let command_tx = command_tx.clone();
+        let current_open = current_open.clone();
+        win.archived_list.connect_open(move |jid, name| {
+            *current_open.borrow_mut() = Some(jid.clone());
+            win_sel.open_chat(&jid, &name);
+            let _ = command_tx.try_send(WaCommand::OpenChat(jid));
+        });
+    }
+
+    // The "Archiviate" entry opens the archived sub-page in the sidebar.
+    {
+        let win_arch = win.clone();
+        win.chat_list
+            .connect_open_archived(move || win_arch.open_archived());
     }
 
     // Scrolled to the top of the open thread: ask for the previous page of the
@@ -100,8 +118,10 @@ fn on_activate(app: &adw::Application) {
             }
         };
         let need2 = need.clone();
+        let need3 = need.clone();
         win.chat_list.connect_need_avatar(need);
         win.thread.connect_need_avatar(need2);
+        win.archived_list.connect_need_avatar(need3);
     }
 
     // Drain backend events on the GTK main loop. `spawn_future_local` guarantees
@@ -138,6 +158,7 @@ fn on_activate(app: &adw::Application) {
                 WaEvent::LoggedOut => {
                     *current_open_ev.borrow_mut() = None;
                     win_ev.chat_list.update(&[]);
+                    win_ev.update_archived(&[]);
                     win_ev.reset_content();
                     win_ev.login.show_waiting();
                     win_ev.show_login();
@@ -152,6 +173,10 @@ fn on_activate(app: &adw::Application) {
                         win_ev.show_main();
                     }
                     win_ev.chat_list.update(&chats);
+                }
+                // Archived list (and its count) refreshed alongside the active list.
+                WaEvent::ArchivedChatsSnapshot(chats) => {
+                    win_ev.update_archived(&chats);
                 }
                 // History/live messages: apply only if their chat is still open.
                 WaEvent::ChatHistory { jid, messages } => {
@@ -174,6 +199,7 @@ fn on_activate(app: &adw::Application) {
                 WaEvent::Avatar { jid, path } => {
                     if let Ok(tex) = gtk::gdk::Texture::from_filename(&path) {
                         win_ev.chat_list.set_avatar(&jid, &tex);
+                        win_ev.archived_list.set_avatar(&jid, &tex);
                         win_ev.thread.set_avatar(&jid, &tex);
                     }
                 }
