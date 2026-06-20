@@ -61,6 +61,8 @@ pub struct ThreadView {
     on_play: PlayCb,
     /// The currently playing voice note, kept alive while it plays.
     player: Rc<RefCell<Option<gtk::MediaFile>>>,
+    /// The composer text entry, so a freshly opened chat can focus it.
+    entry: gtk::Entry,
 }
 
 impl ThreadView {
@@ -209,7 +211,13 @@ impl ThreadView {
             on_send_audio,
             on_play: Rc::new(RefCell::new(None)),
             player: Rc::new(RefCell::new(None)),
+            entry,
         }
+    }
+
+    /// Puts the keyboard focus in the composer so the user can type right away.
+    pub fn focus_composer(&self) {
+        self.entry.grab_focus();
     }
 
     /// Registers the callback invoked with the composed text when the user sends.

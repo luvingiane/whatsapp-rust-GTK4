@@ -178,6 +178,9 @@ impl MainWindow {
         self.content_page.set_title(name);
         self.thread.set_loading(jid.ends_with("@g.us"));
         self.content_stack.set_visible_child_name("thread");
+        // Focus the composer after the page switch so typing works immediately.
+        let thread = self.thread.clone();
+        gtk::glib::idle_add_local_once(move || thread.focus_composer());
     }
 
     /// Render the loaded history for the open chat.
