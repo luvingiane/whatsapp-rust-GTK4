@@ -61,9 +61,9 @@ pub enum WaEvent {
         message_ids: Vec<String>,
         status: i32,
     },
-    /// A voice note has been downloaded + decrypted to `path` (OGG) and is ready
-    /// to play (requested via [`WaCommand::PlayAudio`]).
-    AudioReady { path: String },
+    /// A voice note (message `id`) has been downloaded + decrypted to `path` (OGG)
+    /// and is ready to play (requested via [`WaCommand::PlayAudio`]).
+    AudioReady { id: String, path: String },
 }
 
 /// Commands flowing **from** the GTK UI **to** the WhatsApp backend.
@@ -100,6 +100,8 @@ pub enum WaCommand {
         jid: String,
         ogg: Vec<u8>,
         duration: u32,
+        /// Amplitude waveform (0..100 per bar) computed while recording.
+        waveform: Vec<u8>,
     },
     /// Download + decrypt a stored voice note for playback; the backend replies
     /// with [`WaEvent::AudioReady`] once the OGG is on disk.

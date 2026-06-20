@@ -50,4 +50,8 @@ pub struct MessageRow {
     /// Whether this is a playable audio/voice message (its media metadata is
     /// stored, so the UI shows a play button).
     pub audio: bool,
+    /// Voice-note duration in seconds (0 if unknown / not audio).
+    pub audio_secs: u32,
+    /// Voice-note amplitude waveform (0..100 per bar; empty if none).
+    pub audio_waveform: Vec<u8>,
 }

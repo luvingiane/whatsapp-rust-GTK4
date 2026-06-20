@@ -22,8 +22,95 @@ const BACKFILL_THRESHOLD: f64 = 40.0;
 type LoadOlderCb = Box<dyn Fn(i64, String)>;
 type NeedAvatarCb = Rc<RefCell<Option<Box<dyn Fn(String)>>>>;
 type SendCb = Rc<RefCell<Option<Box<dyn Fn(String)>>>>;
-type SendAudioCb = Rc<RefCell<Option<Box<dyn Fn(Vec<u8>, u32)>>>>;
+type SendAudioCb = Rc<RefCell<Option<Box<dyn Fn(Vec<u8>, u32, Vec<u8>)>>>>;
 type PlayCb = Rc<RefCell<Option<Box<dyn Fn(String, String)>>>>;
+
+/// On-screen pieces of a voice-note bubble, so playback can drive its waveform
+/// fill, time label and play/pause icon.
+#[derive(Clone)]
+struct AudioBubble {
+    button: gtk::Button,
+    area: gtk::DrawingArea,
+    time: gtk::Label,
+    /// Playback fraction 0..1, read by the waveform draw func.
+    progress: Rc<Cell<f64>>,
+    secs: u32,
+}
+
+/// Thin slot (bar + gap) width in px — keeps bars slim and theme-agnostic.
+const BAR_W: f64 = 2.0;
+const SLOT_W: f64 = 4.0;
+
+/// Number of thin bars that fit in `w` px.
+fn bar_count(w: f64) -> usize {
+    ((w / SLOT_W).floor() as usize).max(1)
+}
+
+/// Amplitude (0..1) for bar `i` of `n`, sampled from `waveform` (0..100).
+fn wf_amp(waveform: &[u8], i: usize, n: usize) -> f64 {
+    if waveform.is_empty() {
+        return 0.12;
+    }
+    let idx = (i * waveform.len() / n).min(waveform.len() - 1);
+    (waveform[idx] as f64 / 100.0).clamp(0.0, 1.0)
+}
+
+/// Draws thin amplitude bars (`waveform`, 0..100) using the widget's own
+/// foreground color (so it contrasts the bubble in any theme); bars before
+/// `progress` (0..1) are solid, the rest dimmed.
+fn draw_waveform(
+    area: &gtk::DrawingArea,
+    cr: &gtk::cairo::Context,
+    w: i32,
+    h: i32,
+    waveform: &[u8],
+    progress: f64,
+) {
+    let c = area.color();
+    let w = w as f64;
+    let h = h as f64;
+    let n = bar_count(w);
+    for i in 0..n {
+        let amp = wf_amp(waveform, i, n);
+        let bh = (amp * h).max(2.0);
+        let x = i as f64 * SLOT_W;
+        let y = (h - bh) / 2.0;
+        let played = (i as f64 + 0.5) / n as f64 <= progress;
+        let alpha = if played { 1.0 } else { 0.35 } * c.alpha() as f64;
+        cr.set_source_rgba(c.red() as f64, c.green() as f64, c.blue() as f64, alpha);
+        cr.rectangle(x, y, BAR_W, bh);
+        let _ = cr.fill();
+    }
+}
+
+/// Formats seconds as `m:ss`.
+fn fmt_secs(secs: f64) -> String {
+    let s = secs.max(0.0) as u32;
+    format!("{}:{:02}", s / 60, s % 60)
+}
+
+/// Draws a live recording envelope: the most recent amplitudes (0..1) as thin
+/// bars in the widget's foreground color, left-to-right.
+fn draw_live(area: &gtk::DrawingArea, cr: &gtk::cairo::Context, w: i32, h: i32, levels: &[f64]) {
+    let c = area.color();
+    let w = w as f64;
+    let h = h as f64;
+    let n = bar_count(w);
+    let slice = &levels[levels.len().saturating_sub(n)..];
+    // Raw RMS amplitudes are small for speech; auto-gain to the loudest sample of
+    // the whole take (low floor) and boost perceptually so the bars fill and adapt.
+    let max = levels.iter().cloned().fold(0.0f64, f64::max).max(0.05);
+    cr.set_source_rgba(c.red() as f64, c.green() as f64, c.blue() as f64, c.alpha() as f64);
+    for i in 0..n {
+        let raw = slice.get(i).copied().unwrap_or(0.0);
+        let amp = (raw / max).clamp(0.0, 1.0).sqrt();
+        let bh = (amp * h).max(1.0);
+        let x = i as f64 * SLOT_W;
+        let y = (h - bh) / 2.0;
+        cr.rectangle(x, y, BAR_W, bh);
+    }
+    let _ = cr.fill();
+}
 
 #[derive(Clone)]
 pub struct ThreadView {
@@ -63,6 +150,10 @@ pub struct ThreadView {
     player: Rc<RefCell<Option<gtk::MediaFile>>>,
     /// The composer text entry, so a freshly opened chat can focus it.
     entry: gtk::Entry,
+    /// Voice-note id currently playing (drives toggle + progress).
+    playing_id: Rc<RefCell<Option<String>>>,
+    /// Audio bubbles by message id, to update their waveform/time/icon on play.
+    audio_widgets: Rc<RefCell<HashMap<String, AudioBubble>>>,
 }
 
 impl ThreadView {
@@ -144,22 +235,48 @@ impl ThreadView {
             send.connect_clicked(move |_| do_send());
         }
 
+        // Live recording waveform, shown in place of the entry while recording.
+        let rec_levels: Rc<RefCell<Vec<f64>>> = Rc::new(RefCell::new(Vec::new()));
+        let rec_area = gtk::DrawingArea::builder()
+            .height_request(28)
+            .hexpand(true)
+            .valign(gtk::Align::Center)
+            .build();
+        rec_area.set_visible(false);
+        {
+            let rec_levels = rec_levels.clone();
+            rec_area.set_draw_func(move |area, cr, w, h| {
+                draw_live(area, cr, w, h, &rec_levels.borrow())
+            });
+        }
+        let rec_time = gtk::Label::new(Some("0:00"));
+        rec_time.add_css_class("caption");
+        rec_time.add_css_class("dim-label");
+        rec_time.set_visible(false);
+
         // Mic button toggles a voice-note recording; the second tap stops & sends.
         {
             let recorder = recorder.clone();
             let on_send_audio = on_send_audio.clone();
             let mic_btn = mic.clone();
+            let entry_w = entry.clone();
+            let rec_area_w = rec_area.clone();
+            let rec_time_w = rec_time.clone();
+            let rec_levels = rec_levels.clone();
             mic.connect_clicked(move |_| {
                 let recording = recorder.borrow().is_some();
                 if recording {
                     let rec = recorder.borrow_mut().take();
                     mic_btn.remove_css_class("destructive-action");
                     mic_btn.set_icon_name("audio-input-microphone-symbolic");
+                    rec_area_w.set_visible(false);
+                    rec_time_w.set_visible(false);
+                    entry_w.set_visible(true);
                     if let Some(rec) = rec {
                         match rec.stop() {
-                            Ok((ogg, secs)) => {
+                            Ok((ogg, secs, waveform)) => {
                                 if let Some(cb) = on_send_audio.borrow().as_ref() {
-                                    cb(ogg, secs);
+                                    cb(ogg, secs, waveform);
                                 }
                             }
                             Err(e) => log::warn!("voice note failed: {e:?}"),
@@ -171,6 +288,31 @@ impl ThreadView {
                             *recorder.borrow_mut() = Some(rec);
                             mic_btn.add_css_class("destructive-action");
                             mic_btn.set_icon_name("media-playback-stop-symbolic");
+                            rec_levels.borrow_mut().clear();
+                            entry_w.set_visible(false);
+                            rec_area_w.set_visible(true);
+                            rec_time_w.set_visible(true);
+                            rec_time_w.set_label("0:00");
+                            // Poll mic levels, update the live waveform + timer.
+                            let recorder = recorder.clone();
+                            let rec_levels = rec_levels.clone();
+                            let rec_area = rec_area_w.clone();
+                            let rec_time = rec_time_w.clone();
+                            gtk::glib::timeout_add_local(
+                                std::time::Duration::from_millis(60),
+                                move || {
+                                    match recorder.borrow().as_ref() {
+                                        Some(rec) => {
+                                            rec.poll_levels();
+                                            *rec_levels.borrow_mut() = rec.levels();
+                                            rec_area.queue_draw();
+                                            rec_time.set_label(&fmt_secs(rec.elapsed_secs() as f64));
+                                            gtk::glib::ControlFlow::Continue
+                                        }
+                                        None => gtk::glib::ControlFlow::Break,
+                                    }
+                                },
+                            );
                         }
                         Err(e) => log::warn!("cannot start recording: {e:?}"),
                     }
@@ -187,6 +329,8 @@ impl ThreadView {
             .margin_end(6)
             .build();
         composer.append(&entry);
+        composer.append(&rec_area);
+        composer.append(&rec_time);
         composer.append(&mic);
         composer.append(&send);
 
@@ -212,6 +356,8 @@ impl ThreadView {
             on_play: Rc::new(RefCell::new(None)),
             player: Rc::new(RefCell::new(None)),
             entry,
+            playing_id: Rc::new(RefCell::new(None)),
+            audio_widgets: Rc::new(RefCell::new(HashMap::new())),
         }
     }
 
@@ -227,7 +373,7 @@ impl ThreadView {
 
     /// Registers the callback invoked with `(ogg_bytes, duration_secs)` for a
     /// recorded voice note.
-    pub fn connect_send_audio<F: Fn(Vec<u8>, u32) + 'static>(&self, f: F) {
+    pub fn connect_send_audio<F: Fn(Vec<u8>, u32, Vec<u8>) + 'static>(&self, f: F) {
         *self.on_send_audio.borrow_mut() = Some(Box::new(f));
     }
 
@@ -237,12 +383,53 @@ impl ThreadView {
         *self.on_play.borrow_mut() = Some(Box::new(f));
     }
 
-    /// Plays a downloaded voice note from `path`, stopping any current playback.
-    pub fn play_audio(&self, path: &str) {
+    /// Plays a downloaded voice note (`id` → `path`), stopping any current one and
+    /// driving the matching bubble's waveform fill / time / play-pause icon.
+    pub fn play_audio(&self, id: &str, path: &str) {
+        // Stop and reset the previously playing bubble.
         if let Some(prev) = self.player.borrow_mut().take() {
             prev.pause();
         }
+        if let Some(prev_id) = self.playing_id.borrow_mut().take() {
+            if let Some(w) = self.audio_widgets.borrow().get(&prev_id) {
+                w.progress.set(0.0);
+                w.area.queue_draw();
+                w.button.set_icon_name("media-playback-start-symbolic");
+                w.time.set_label(&fmt_secs(w.secs as f64));
+            }
+        }
+
         let media = gtk::MediaFile::for_filename(path);
+        *self.playing_id.borrow_mut() = Some(id.to_string());
+        if let Some(w) = self.audio_widgets.borrow().get(id) {
+            w.button.set_icon_name("media-playback-pause-symbolic");
+        }
+        // Update the bubble as playback advances; reset at the end.
+        {
+            let widgets = self.audio_widgets.clone();
+            let playing_id = self.playing_id.clone();
+            let id = id.to_string();
+            media.connect_timestamp_notify(move |m| {
+                let dur = m.duration();
+                let ts = m.timestamp();
+                let frac = if dur > 0 { (ts as f64 / dur as f64).clamp(0.0, 1.0) } else { 0.0 };
+                let widgets = widgets.borrow();
+                let Some(w) = widgets.get(&id) else { return };
+                if m.is_ended() || (dur > 0 && ts >= dur) {
+                    w.progress.set(0.0);
+                    w.button.set_icon_name("media-playback-start-symbolic");
+                    w.time.set_label(&fmt_secs(w.secs as f64));
+                    if playing_id.borrow().as_deref() == Some(id.as_str()) {
+                        *playing_id.borrow_mut() = None;
+                    }
+                } else {
+                    w.progress.set(frac);
+                    let pos = ts as f64 / 1_000_000.0;
+                    w.time.set_label(&fmt_secs(pos));
+                }
+                w.area.queue_draw();
+            });
+        }
         media.play();
         *self.player.borrow_mut() = Some(media);
     }
@@ -335,6 +522,11 @@ impl ThreadView {
         self.exhausted.set(false);
         self.senders.borrow_mut().clear();
         self.ticks.borrow_mut().clear();
+        self.audio_widgets.borrow_mut().clear();
+        if let Some(p) = self.player.borrow_mut().take() {
+            p.pause();
+        }
+        *self.playing_id.borrow_mut() = None;
     }
 
     /// Advances the ✓/✓✓ glyph of one of our sent bubbles when a receipt lands
@@ -375,28 +567,74 @@ impl ThreadView {
         }
 
         if m.audio {
-            // Voice note: a play button that requests download+playback, plus the
-            // "🎤 Messaggio vocale" label.
+            // Voice-note player: play/pause + waveform with progress + duration.
             let play = gtk::Button::from_icon_name("media-playback-start-symbolic");
             play.add_css_class("circular");
             play.set_valign(gtk::Align::Center);
+
+            let progress = Rc::new(Cell::new(0.0));
+            let area = gtk::DrawingArea::builder()
+                .height_request(28)
+                .width_request(140)
+                .hexpand(true)
+                .valign(gtk::Align::Center)
+                .build();
+            {
+                let progress = progress.clone();
+                let wf = m.audio_waveform.clone();
+                area.set_draw_func(move |area, cr, w, h| {
+                    draw_waveform(area, cr, w, h, &wf, progress.get())
+                });
+            }
+            let dur_label = gtk::Label::new(Some(&fmt_secs(m.audio_secs as f64)));
+            dur_label.add_css_class("caption");
+            dur_label.add_css_class("dim-label");
+
+            // Click: toggle if this note is the active one, else request playback.
             {
                 let on_play = self.on_play.clone();
                 let chat = m.chat_jid.clone();
                 let id = m.id.clone();
+                let player = self.player.clone();
+                let playing_id = self.playing_id.clone();
+                let btn = play.clone();
                 play.connect_clicked(move |_| {
+                    if playing_id.borrow().as_deref() == Some(id.as_str()) {
+                        if let Some(media) = player.borrow().as_ref() {
+                            if media.is_playing() {
+                                media.pause();
+                                btn.set_icon_name("media-playback-start-symbolic");
+                            } else {
+                                media.play();
+                                btn.set_icon_name("media-playback-pause-symbolic");
+                            }
+                            return;
+                        }
+                    }
                     if let Some(cb) = on_play.borrow().as_ref() {
                         cb(chat.clone(), id.clone());
                     }
                 });
             }
-            let label = gtk::Label::builder().label(&m.body).xalign(0.0).build();
+
+            self.audio_widgets.borrow_mut().insert(
+                m.id.clone(),
+                AudioBubble {
+                    button: play.clone(),
+                    area: area.clone(),
+                    time: dur_label.clone(),
+                    progress,
+                    secs: m.audio_secs,
+                },
+            );
+
             let row = gtk::Box::builder()
                 .orientation(gtk::Orientation::Horizontal)
                 .spacing(8)
                 .build();
             row.append(&play);
-            row.append(&label);
+            row.append(&area);
+            row.append(&dur_label);
             bubble.append(&row);
         } else {
             let text = gtk::Label::builder()
@@ -408,7 +646,20 @@ impl ThreadView {
                 .wrap_mode(gtk::pango::WrapMode::WordChar)
                 .max_width_chars(42)
                 .selectable(true)
+                // Render URLs as clickable links (markup), text stays selectable.
+                .use_markup(true)
                 .build();
+            text.set_markup(&crate::util::text::linkify(&m.body));
+            // Open links in the default browser (no hardcoded launcher command).
+            text.connect_activate_link(|label, uri| {
+                let ctx = label.display().app_launch_context();
+                if let Err(e) =
+                    gtk::gio::AppInfo::launch_default_for_uri(uri, Some(&ctx))
+                {
+                    log::warn!("open link failed: {e}");
+                }
+                glib::Propagation::Stop
+            });
             bubble.append(&text);
         }
 

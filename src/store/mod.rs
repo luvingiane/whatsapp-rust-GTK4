@@ -69,6 +69,10 @@ CREATE TABLE IF NOT EXISTS messages (
   -- Serialized wa::Message proto for downloadable media (audio/voice notes), so
   -- the note can be fetched + decrypted on play. NULL for non-media messages.
   media      BLOB,
+  -- Voice-note duration (seconds) and amplitude waveform (0..100 per bar) for the
+  -- player UI. NULL for non-audio messages.
+  audio_secs INTEGER,
+  audio_waveform BLOB,
   PRIMARY KEY (chat_jid, id)
 );
 CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages(chat_jid, ts);
@@ -82,6 +86,8 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE chats ADD COLUMN last_status INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE messages ADD COLUMN status INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE messages ADD COLUMN media BLOB",
+    "ALTER TABLE messages ADD COLUMN audio_secs INTEGER",
+    "ALTER TABLE messages ADD COLUMN audio_waveform BLOB",
 ];
 
 /// Run on every open. (1) Baseline ✓ for our own messages that lack a status.
@@ -655,6 +661,26 @@ impl Store {
         .await?
     }
 
+    /// Stores a voice note's duration + waveform for the player UI. Idempotent.
+    pub async fn set_audio_meta(
+        &self,
+        chat_jid: String,
+        id: String,
+        secs: u32,
+        waveform: Vec<u8>,
+    ) -> Result<()> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let guard = conn.lock().map_err(|_| anyhow!("store mutex poisoned"))?;
+            guard.execute(
+                "UPDATE messages SET audio_secs=?3, audio_waveform=?4 WHERE chat_jid=?1 AND id=?2",
+                params![chat_jid, id, secs, waveform],
+            )?;
+            Ok(())
+        })
+        .await?
+    }
+
     /// Returns the stored media proto for a message, if any.
     pub async fn get_media(&self, chat_jid: String, id: String) -> Result<Option<Vec<u8>>> {
         let conn = self.conn.clone();
@@ -684,9 +710,10 @@ impl Store {
             let mut stmt = guard.prepare(
                 "SELECT x.id, x.sender_jid,
                         COALESCE(NULLIF(cm.saved_name,''), NULLIF(ct.name,''), '') AS sender_name,
-                        x.from_me, x.ts, x.body, x.status, (x.media IS NOT NULL) AS audio
+                        x.from_me, x.ts, x.body, x.status, (x.media IS NOT NULL) AS audio,
+                        x.audio_secs, x.audio_waveform
                  FROM (
-                   SELECT id, sender_jid, from_me, ts, body, status, media
+                   SELECT id, sender_jid, from_me, ts, body, status, media, audio_secs, audio_waveform
                    FROM messages WHERE chat_jid=?1
                    ORDER BY ts DESC, id DESC LIMIT ?2
                  ) x
@@ -706,6 +733,8 @@ impl Store {
                         body: r.get(5)?,
                         status: r.get::<_, i64>(6)? as i32,
                         audio: r.get::<_, i64>(7)? != 0,
+                        audio_secs: r.get::<_, Option<i64>>(8)?.unwrap_or(0) as u32,
+                        audio_waveform: r.get::<_, Option<Vec<u8>>>(9)?.unwrap_or_default(),
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -732,9 +761,10 @@ impl Store {
             let mut stmt = guard.prepare(
                 "SELECT x.id, x.sender_jid,
                         COALESCE(NULLIF(cm.saved_name,''), NULLIF(ct.name,''), '') AS sender_name,
-                        x.from_me, x.ts, x.body, x.status, (x.media IS NOT NULL) AS audio
+                        x.from_me, x.ts, x.body, x.status, (x.media IS NOT NULL) AS audio,
+                        x.audio_secs, x.audio_waveform
                  FROM (
-                   SELECT id, sender_jid, from_me, ts, body, status, media
+                   SELECT id, sender_jid, from_me, ts, body, status, media, audio_secs, audio_waveform
                    FROM messages
                    WHERE chat_jid=?1 AND (ts < ?2 OR (ts = ?2 AND id < ?3))
                    ORDER BY ts DESC, id DESC LIMIT ?4
@@ -755,6 +785,8 @@ impl Store {
                         body: r.get(5)?,
                         status: r.get::<_, i64>(6)? as i32,
                         audio: r.get::<_, i64>(7)? != 0,
+                        audio_secs: r.get::<_, Option<i64>>(8)?.unwrap_or(0) as u32,
+                        audio_waveform: r.get::<_, Option<Vec<u8>>>(9)?.unwrap_or_default(),
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;

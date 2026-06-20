@@ -20,16 +20,38 @@ the *native* way:
 It talks to WhatsApp through the [`whatsapp-rust`](https://github.com/jlucaso1/whatsapp-rust)
 crate (an independent Rust implementation of the WhatsApp Web protocol).
 
-## ✨ What it should do (eventually)
+## ✨ Roadmap & status
 
-Roughly, and not all there yet — this is a roadmap, not a feature list:
+This is a roadmap, not a finished feature list — it moves fast.
 
-- 📱 Log in by scanning a QR code, and stay logged in across restarts ✅ *(done)*
-- 💬 Chat list + conversations with proper sent/received bubbles
-- ⌨️ Send & receive text messages in real time
-- 🖼️ **Media**: photos, videos, GIFs, stickers, voice notes, documents — send & receive
-- 👀 Typing / delivery / read indicators
-- 🪶 All of the above while staying light and native
+**✅ Working today**
+
+- 📱 QR login, persistent across restarts (reconnects without re-scanning).
+- 💬 Chat list + conversations: message history (with scroll-up backfill) and live
+  messages, proper sent/received bubbles, profile-picture avatars, chat search.
+- ⌨️ Send & receive **text** in real time, with clickable links.
+- 🎤 **Voice notes**: record (with a live waveform + timer), send, receive, and play
+  back with a waveform, progress bar and elapsed time.
+- ✔️ **Delivery / read ticks** (✓ sent, ✓✓ delivered, blue ✓✓ read) — in bubbles and as
+  a prefix in the chat-list preview.
+- 🟢 **Presence**: reports online only while the window is focused/active and "away"
+  when unfocused or idle, so your phone resumes its own notifications when you step away.
+- 🗂️ **Archived chats** view with an unread count; read chats clear their unread badge
+  (incl. reads done on the phone); duplicate `@lid`/PN chats are merged.
+
+**🚧 Not there yet**
+
+- 🖼️ Other media — photos, videos, GIFs, stickers, documents (send & receive). Only
+  voice notes are wired so far.
+- ⌨️ "Typing…" indicators, reactions, replies/quotes, group management.
+
+**⚠️ Known limitations**
+
+- **Archived accuracy** depends on resolving WhatsApp's LID↔phone-number identities.
+  That mapping fills in over time (and as you open chats); the bulk server lookup is
+  rate-limited, so a few archived chats can linger in the main list until their pair is
+  learned.
+- 🪶 Goal throughout: stay light and native (one Rust process, no Chromium).
 
 ## 🤖 Heads-up: this is "vibecoded"
 
@@ -48,14 +70,37 @@ issues, and fixes are all very welcome.
 
 ## 🧪 Try it (early adopters only)
 
-You'll need a Rust toolchain plus GTK4 + libadwaita dev packages. On **Arch/Manjaro**:
+You'll need a Rust toolchain, GTK4 + libadwaita dev packages, and GStreamer (with the
+base/good plugins, for recording & playing voice notes). On **Arch/Manjaro**:
 
 ```bash
-sudo pacman -S --needed rust gtk4 libadwaita pkgconf sqlite
+sudo pacman -S --needed rust gtk4 libadwaita pkgconf sqlite \
+    gstreamer gst-plugins-base gst-plugins-good
 cargo run
 ```
 
-(See the build files for other distros — more docs coming as the project matures.)
+(On Debian/Ubuntu the equivalents are `libgtk-4-dev libadwaita-1-dev libsqlite3-dev
+libgstreamer1.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good`. More docs
+coming as the project matures.)
+
+## 🧹 Uninstall
+
+There's nothing system-wide to remove — it's a plain Cargo build — but it does keep
+local state. Two things to clean up:
+
+1. **The app itself**: delete the cloned repo (and run `cargo clean` first if you want to
+   drop the `target/` build cache). No files are installed outside the project folder.
+2. **Your data & login (the databases)**: all session + chat state lives under
+   `~/.local/share/whatsapp-rust-gtk4/` (the `whatsapp.db` session and `app.db` chat
+   store) plus a cache in `~/.cache/whatsapp-rust-gtk4/` (avatars, downloaded voice
+   notes). Remove them with:
+
+   ```bash
+   rm -rf ~/.local/share/whatsapp-rust-gtk4 ~/.cache/whatsapp-rust-gtk4
+   ```
+
+   ⚠️ Deleting `whatsapp.db` **unlinks this device** from your phone — you'll have to
+   scan the QR code again next time, and WhatsApp keeps only a handful of linked devices.
 
 ## 🙏 Acknowledgements & thanks
 

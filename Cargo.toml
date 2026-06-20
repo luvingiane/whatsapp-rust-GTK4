@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.80"
 license = "GPL-3.0-or-later"
 description = "Native GTK4 + libadwaita WhatsApp client written in Rust"
-repository = "https://github.com/Matt/whatsapp-rust-GTK4"
+repository = "https://github.com/luvingiane/whatsapp-rust-GTK4"
 default-run = "whatsapp-rust-gtk4"
 
 [dependencies]

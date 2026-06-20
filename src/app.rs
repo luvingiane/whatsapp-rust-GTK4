@@ -138,9 +138,9 @@ fn on_activate(app: &adw::Application) {
     {
         let command_tx = command_tx.clone();
         let current_open = current_open.clone();
-        win.thread.connect_send_audio(move |ogg, duration| {
+        win.thread.connect_send_audio(move |ogg, duration, waveform| {
             if let Some(jid) = current_open.borrow().clone() {
-                let _ = command_tx.try_send(WaCommand::SendAudio { jid, ogg, duration });
+                let _ = command_tx.try_send(WaCommand::SendAudio { jid, ogg, duration, waveform });
             }
         });
     }
@@ -288,8 +288,8 @@ fn on_activate(app: &adw::Application) {
                     }
                 }
                 // A voice note finished downloading: play it.
-                WaEvent::AudioReady { path } => {
-                    win_ev.thread.play_audio(&path);
+                WaEvent::AudioReady { id, path } => {
+                    win_ev.thread.play_audio(&id, &path);
                 }
             }
         }
