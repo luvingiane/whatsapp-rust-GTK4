@@ -8,7 +8,7 @@
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::model::{ChatSummary, MessageRow};
 use crate::util::preview;
@@ -66,6 +66,9 @@ CREATE TABLE IF NOT EXISTS messages (
   -- Delivery status for our own messages: 0 none/incoming, 1 sent (✓),
   -- 2 delivered (✓✓), 3 read/played (✓✓ blue).
   status     INTEGER NOT NULL DEFAULT 0,
+  -- Serialized wa::Message proto for downloadable media (audio/voice notes), so
+  -- the note can be fetched + decrypted on play. NULL for non-media messages.
+  media      BLOB,
   PRIMARY KEY (chat_jid, id)
 );
 CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages(chat_jid, ts);
@@ -78,6 +81,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages(chat_jid, ts);
 const MIGRATIONS: &[&str] = &[
     "ALTER TABLE chats ADD COLUMN last_status INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE messages ADD COLUMN status INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE messages ADD COLUMN media BLOB",
 ];
 
 /// Run on every open. (1) Baseline ✓ for our own messages that lack a status.
@@ -562,6 +566,39 @@ impl Store {
         .await?
     }
 
+    /// Stores the serialized media proto for a message (audio/voice note), so it
+    /// can be downloaded + decrypted on play. Idempotent.
+    pub async fn set_media(&self, chat_jid: String, id: String, media: Vec<u8>) -> Result<()> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let guard = conn.lock().map_err(|_| anyhow!("store mutex poisoned"))?;
+            guard.execute(
+                "UPDATE messages SET media=?3 WHERE chat_jid=?1 AND id=?2",
+                params![chat_jid, id, media],
+            )?;
+            Ok(())
+        })
+        .await?
+    }
+
+    /// Returns the stored media proto for a message, if any.
+    pub async fn get_media(&self, chat_jid: String, id: String) -> Result<Option<Vec<u8>>> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<Option<Vec<u8>>> {
+            let guard = conn.lock().map_err(|_| anyhow!("store mutex poisoned"))?;
+            let media = guard
+                .query_row(
+                    "SELECT media FROM messages WHERE chat_jid=?1 AND id=?2",
+                    params![chat_jid, id],
+                    |r| r.get::<_, Option<Vec<u8>>>(0),
+                )
+                .optional()?
+                .flatten();
+            Ok(media)
+        })
+        .await?
+    }
+
     /// Loads the most recent `limit` messages of a chat, returned oldest-first.
     pub async fn load_messages(&self, chat_jid: String, limit: i64) -> Result<Vec<MessageRow>> {
         let conn = self.conn.clone();
@@ -573,9 +610,9 @@ impl Store {
             let mut stmt = guard.prepare(
                 "SELECT x.id, x.sender_jid,
                         COALESCE(NULLIF(cm.saved_name,''), NULLIF(ct.name,''), '') AS sender_name,
-                        x.from_me, x.ts, x.body, x.status
+                        x.from_me, x.ts, x.body, x.status, (x.media IS NOT NULL) AS audio
                  FROM (
-                   SELECT id, sender_jid, from_me, ts, body, status
+                   SELECT id, sender_jid, from_me, ts, body, status, media
                    FROM messages WHERE chat_jid=?1
                    ORDER BY ts DESC, id DESC LIMIT ?2
                  ) x
@@ -594,6 +631,7 @@ impl Store {
                         ts: r.get(4)?,
                         body: r.get(5)?,
                         status: r.get::<_, i64>(6)? as i32,
+                        audio: r.get::<_, i64>(7)? != 0,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -620,9 +658,9 @@ impl Store {
             let mut stmt = guard.prepare(
                 "SELECT x.id, x.sender_jid,
                         COALESCE(NULLIF(cm.saved_name,''), NULLIF(ct.name,''), '') AS sender_name,
-                        x.from_me, x.ts, x.body, x.status
+                        x.from_me, x.ts, x.body, x.status, (x.media IS NOT NULL) AS audio
                  FROM (
-                   SELECT id, sender_jid, from_me, ts, body, status
+                   SELECT id, sender_jid, from_me, ts, body, status, media
                    FROM messages
                    WHERE chat_jid=?1 AND (ts < ?2 OR (ts = ?2 AND id < ?3))
                    ORDER BY ts DESC, id DESC LIMIT ?4
@@ -642,6 +680,7 @@ impl Store {
                         ts: r.get(4)?,
                         body: r.get(5)?,
                         status: r.get::<_, i64>(6)? as i32,
+                        audio: r.get::<_, i64>(7)? != 0,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;

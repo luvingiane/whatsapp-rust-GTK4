@@ -68,6 +68,18 @@ pub fn avatar_cache_path(jid: &str) -> anyhow::Result<PathBuf> {
     Ok(dir)
 }
 
+/// Returns the cache path for a downloaded voice note, creating the audio cache
+/// directory (`~/.cache/whatsapp-rust-gtk4/audio/<sanitized-id>.ogg`). Decrypted
+/// notes are cached so replaying one doesn't re-hit the network.
+pub fn audio_cache_path(id: &str) -> anyhow::Result<PathBuf> {
+    let mut dir = glib::user_cache_dir();
+    dir.push(DATA_SUBDIR);
+    dir.push("audio");
+    std::fs::create_dir_all(&dir)?;
+    dir.push(format!("{}.ogg", sanitize(id)));
+    Ok(dir)
+}
+
 /// Maps a JID to a safe filename stem: every non-alphanumeric byte becomes `_`.
 fn sanitize(jid: &str) -> String {
     jid.chars()
