@@ -47,4 +47,7 @@ pub struct MessageRow {
     /// Delivery status for our own messages: 0 none/incoming, 1 sent (✓),
     /// 2 delivered (✓✓), 3 read/played (✓✓ blue).
     pub status: i32,
+    /// Whether this is a playable audio/voice message (its media metadata is
+    /// stored, so the UI shows a play button).
+    pub audio: bool,
 }

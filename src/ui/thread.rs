@@ -23,6 +23,7 @@ type LoadOlderCb = Box<dyn Fn(i64, String)>;
 type NeedAvatarCb = Rc<RefCell<Option<Box<dyn Fn(String)>>>>;
 type SendCb = Rc<RefCell<Option<Box<dyn Fn(String)>>>>;
 type SendAudioCb = Rc<RefCell<Option<Box<dyn Fn(Vec<u8>, u32)>>>>;
+type PlayCb = Rc<RefCell<Option<Box<dyn Fn(String, String)>>>>;
 
 #[derive(Clone)]
 pub struct ThreadView {
@@ -56,6 +57,10 @@ pub struct ThreadView {
     on_send: SendCb,
     /// Invoked with `(ogg_bytes, duration_secs)` when a voice note is recorded.
     on_send_audio: SendAudioCb,
+    /// Invoked with `(chat_jid, id)` when a voice note's play button is pressed.
+    on_play: PlayCb,
+    /// The currently playing voice note, kept alive while it plays.
+    player: Rc<RefCell<Option<gtk::MediaFile>>>,
 }
 
 impl ThreadView {
@@ -202,6 +207,8 @@ impl ThreadView {
             ticks: Rc::new(RefCell::new(HashMap::new())),
             on_send,
             on_send_audio,
+            on_play: Rc::new(RefCell::new(None)),
+            player: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -214,6 +221,22 @@ impl ThreadView {
     /// recorded voice note.
     pub fn connect_send_audio<F: Fn(Vec<u8>, u32) + 'static>(&self, f: F) {
         *self.on_send_audio.borrow_mut() = Some(Box::new(f));
+    }
+
+    /// Registers the callback invoked with `(chat_jid, id)` when a voice note's
+    /// play button is pressed.
+    pub fn connect_play<F: Fn(String, String) + 'static>(&self, f: F) {
+        *self.on_play.borrow_mut() = Some(Box::new(f));
+    }
+
+    /// Plays a downloaded voice note from `path`, stopping any current playback.
+    pub fn play_audio(&self, path: &str) {
+        if let Some(prev) = self.player.borrow_mut().take() {
+            prev.pause();
+        }
+        let media = gtk::MediaFile::for_filename(path);
+        media.play();
+        *self.player.borrow_mut() = Some(media);
     }
 
     /// Prepare for a freshly opened chat: clear bubbles and record group-ness.
@@ -343,17 +366,43 @@ impl ThreadView {
             bubble.append(&sender);
         }
 
-        let text = gtk::Label::builder()
-            .label(&m.body)
-            .xalign(0.0)
-            .wrap(true)
-            // WordChar so a long unbreakable URL wraps by character instead of
-            // forcing a huge minimum width on the bubble (and the window).
-            .wrap_mode(gtk::pango::WrapMode::WordChar)
-            .max_width_chars(42)
-            .selectable(true)
-            .build();
-        bubble.append(&text);
+        if m.audio {
+            // Voice note: a play button that requests download+playback, plus the
+            // "🎤 Messaggio vocale" label.
+            let play = gtk::Button::from_icon_name("media-playback-start-symbolic");
+            play.add_css_class("circular");
+            play.set_valign(gtk::Align::Center);
+            {
+                let on_play = self.on_play.clone();
+                let chat = m.chat_jid.clone();
+                let id = m.id.clone();
+                play.connect_clicked(move |_| {
+                    if let Some(cb) = on_play.borrow().as_ref() {
+                        cb(chat.clone(), id.clone());
+                    }
+                });
+            }
+            let label = gtk::Label::builder().label(&m.body).xalign(0.0).build();
+            let row = gtk::Box::builder()
+                .orientation(gtk::Orientation::Horizontal)
+                .spacing(8)
+                .build();
+            row.append(&play);
+            row.append(&label);
+            bubble.append(&row);
+        } else {
+            let text = gtk::Label::builder()
+                .label(&m.body)
+                .xalign(0.0)
+                .wrap(true)
+                // WordChar so a long unbreakable URL wraps by character instead of
+                // forcing a huge minimum width on the bubble (and the window).
+                .wrap_mode(gtk::pango::WrapMode::WordChar)
+                .max_width_chars(42)
+                .selectable(true)
+                .build();
+            bubble.append(&text);
+        }
 
         let time = gtk::Label::builder()
             .label(format_time(m.ts))

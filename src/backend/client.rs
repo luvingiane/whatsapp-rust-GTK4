@@ -18,6 +18,7 @@ use wacore::types::presence::ReceiptType;
 use whatsapp_rust::bot::Bot;
 use whatsapp_rust::client::Client;
 use whatsapp_rust::media::{audio_message, AudioOptions};
+use whatsapp_rust::waproto::codec;
 use whatsapp_rust::UploadOptions;
 use whatsapp_rust::waproto::whatsapp as wa;
 use whatsapp_rust::waproto::whatsapp::device_props::PlatformType;
@@ -253,7 +254,7 @@ pub async fn run(
                         match jid.parse::<whatsapp_rust::Jid>() {
                             Ok(to) => match cmd_client.send_text(to, text.clone()).await {
                                 Ok(res) => {
-                                    store_outgoing(&store, &event_tx, &dirty, jid, text, res.message_id).await;
+                                    store_outgoing(&store, &event_tx, &dirty, jid, text, res.message_id, None).await;
                                 }
                                 Err(e) => {
                                     warn!("send_text failed: {e:?}");
@@ -274,9 +275,11 @@ pub async fn run(
                                     mimetype: None,
                                     waveform: None,
                                 });
+                                // Keep the media proto so our own note is replayable.
+                                let media = codec::message_to_vec(&msg);
                                 match cmd_client.send_message(to, msg).await {
                                     Ok(res) => {
-                                        store_outgoing(&store, &event_tx, &dirty, jid, "🎤 Messaggio vocale".to_string(), res.message_id).await;
+                                        store_outgoing(&store, &event_tx, &dirty, jid, "🎤 Messaggio vocale".to_string(), res.message_id, Some(media)).await;
                                     }
                                     Err(e) => {
                                         warn!("send audio failed: {e:?}");
@@ -290,6 +293,50 @@ pub async fn run(
                             }
                         },
                         Err(e) => warn!("send_audio: bad jid {jid}: {e:?}"),
+                    }
+                }
+                Ok(WaCommand::PlayAudio { chat_jid, id }) => {
+                    let path = match config::audio_cache_path(&id) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            warn!("audio_cache_path failed: {e:?}");
+                            continue;
+                        }
+                    };
+                    // Cache hit: reply at once.
+                    if path.exists() {
+                        let _ = event_tx
+                            .send(WaEvent::AudioReady { path: path.to_string_lossy().into_owned() })
+                            .await;
+                        continue;
+                    }
+                    // Decode the stored proto → AudioMessage → download + decrypt.
+                    match store.get_media(chat_jid.clone(), id.clone()).await {
+                        Ok(Some(bytes)) => {
+                            match codec::message_decode(&bytes) {
+                                Ok(msg) => match msg.audio_message {
+                                    Some(audio) => match cmd_client.download(&*audio).await {
+                                        Ok(ogg) => {
+                                            if let Err(e) = std::fs::write(&path, &ogg) {
+                                                warn!("write voice note failed: {e:?}");
+                                            } else {
+                                                let _ = event_tx
+                                                    .send(WaEvent::AudioReady { path: path.to_string_lossy().into_owned() })
+                                                    .await;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!("audio download failed: {e:?}");
+                                            let _ = event_tx.send(WaEvent::Error(format!("Download vocale fallito: {e}"))).await;
+                                        }
+                                    },
+                                    None => warn!("stored media has no audio_message: {id}"),
+                                },
+                                Err(e) => warn!("decode media proto failed: {e:?}"),
+                            }
+                        }
+                        Ok(None) => warn!("no media stored for {id}"),
+                        Err(e) => warn!("get_media failed: {e:?}"),
                     }
                 }
                 Ok(WaCommand::Shutdown) => {
@@ -394,13 +441,14 @@ async fn store_outgoing(
     chat: String,
     body: String,
     id: String,
+    media: Option<Vec<u8>>,
 ) {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     let row = MessageRow {
-        id,
+        id: id.clone(),
         chat_jid: chat.clone(),
         sender_jid: String::new(),
         sender_name: String::new(),
@@ -408,9 +456,15 @@ async fn store_outgoing(
         ts,
         body: body.clone(),
         status: 1,
+        audio: media.is_some(),
     };
     if let Err(e) = store.insert_message(row.clone()).await {
         warn!("store_outgoing insert failed: {e:?}");
+    }
+    if let Some(bytes) = media {
+        if let Err(e) = store.set_media(chat.clone(), id, bytes).await {
+            warn!("store_outgoing set_media failed: {e:?}");
+        }
     }
     if let Err(e) = store.apply_message(chat, body, ts, true, 1).await {
         warn!("store_outgoing apply failed: {e:?}");
@@ -514,7 +568,7 @@ async fn handle_event(
                 // Canonicalize each conversation's JID (resolve @lid→PN) so chats
                 // are keyed consistently and @lid chats aren't dropped/duplicated.
                 let mut rows: Vec<ChatUpsert> = Vec::new();
-                let mut msgs: Vec<MessageRow> = Vec::new();
+                let mut msgs: Vec<(MessageRow, Option<Vec<u8>>)> = Vec::new();
                 for c in &hs.conversations {
                     if !is_user_chat(&c.id) {
                         continue;
@@ -532,14 +586,27 @@ async fn handle_event(
                     }
                 }
                 if !msgs.is_empty() {
-                    let from_me = msgs.iter().filter(|m| m.from_me).count();
-                    let with_status = msgs.iter().filter(|m| m.status >= 2).count();
+                    let from_me = msgs.iter().filter(|(m, _)| m.from_me).count();
+                    let with_status = msgs.iter().filter(|(m, _)| m.status >= 2).count();
                     info!(
                         "history sync: storing {} messages ({from_me} ours, {with_status} already ✓✓/read)",
                         msgs.len()
                     );
-                    if let Err(e) = store.insert_messages(msgs).await {
+                    // Media to persist after the rows exist (voice notes).
+                    let media: Vec<(String, String, Vec<u8>)> = msgs
+                        .iter()
+                        .filter_map(|(m, media)| {
+                            media.as_ref().map(|b| (m.chat_jid.clone(), m.id.clone(), b.clone()))
+                        })
+                        .collect();
+                    let rows: Vec<MessageRow> = msgs.into_iter().map(|(m, _)| m).collect();
+                    if let Err(e) = store.insert_messages(rows).await {
                         warn!("insert_messages failed: {e:?}");
+                    }
+                    for (chat_jid, id, bytes) in media {
+                        if let Err(e) = store.set_media(chat_jid, id, bytes).await {
+                            warn!("set_media (history) failed: {e:?}");
+                        }
                     }
                 }
                 dirty.notify_one();
@@ -576,6 +643,11 @@ async fn handle_event(
                     // Our own live message is at least server-acked → one tick;
                     // incoming messages carry no status.
                     let status = if from_me { 1 } else { 0 };
+                    // Keep the media proto for playable voice notes.
+                    let audio_media = msg
+                        .audio_message
+                        .as_ref()
+                        .map(|_| codec::message_to_vec(msg));
                     let row = MessageRow {
                         id: info.id.clone(),
                         chat_jid: chat.clone(),
@@ -591,6 +663,7 @@ async fn handle_event(
                         ts,
                         body: body.clone(),
                         status,
+                        audio: audio_media.is_some(),
                     };
                     // Insert first: a `false` means this is the self-fanout echo of
                     // a message we already inserted on send — skip the preview bump
@@ -604,6 +677,11 @@ async fn handle_event(
                     };
                     if inserted {
                         info!("message: from_me={from_me} status={status} id={} chat={chat}", info.id);
+                        if let Some(bytes) = audio_media {
+                            if let Err(e) = store.set_media(chat.clone(), info.id.clone(), bytes).await {
+                                warn!("set_media (live) failed: {e:?}");
+                            }
+                        }
                         if let Err(e) = store
                             .apply_message(chat, body, ts, from_me, status)
                             .await
@@ -890,9 +968,10 @@ fn conv_to_upsert(c: &wa::Conversation, jid: &str) -> Option<ChatUpsert> {
 }
 
 /// Extracts all displayable messages of a conversation into owned [`MessageRow`]s
-/// for the message store, keyed by the given (canonicalized) `chat` JID.
-/// System/protocol/empty messages are skipped.
-fn conv_to_messages(c: &wa::Conversation, chat: &str) -> Vec<MessageRow> {
+/// for the message store (paired with the serialized media proto for audio/voice
+/// notes), keyed by the given (canonicalized) `chat` JID. System/protocol/empty
+/// messages are skipped.
+fn conv_to_messages(c: &wa::Conversation, chat: &str) -> Vec<(MessageRow, Option<Vec<u8>>)> {
     if !is_user_chat(chat) {
         return Vec::new();
     }
@@ -913,7 +992,12 @@ fn conv_to_messages(c: &wa::Conversation, chat: &str) -> Vec<MessageRow> {
                 .clone()
                 .unwrap_or_else(|| chat.to_string());
             let from_me = wmi.key.from_me.unwrap_or(false);
-            Some(MessageRow {
+            // Keep the media proto for playable voice notes.
+            let media = msg
+                .audio_message
+                .as_ref()
+                .map(|_| codec::message_to_vec(msg));
+            let row = MessageRow {
                 id,
                 chat_jid: chat.to_string(),
                 sender_jid,
@@ -924,7 +1008,9 @@ fn conv_to_messages(c: &wa::Conversation, chat: &str) -> Vec<MessageRow> {
                 body,
                 // Delivery status from the synced WebMessageInfo (our msgs only).
                 status: wmi_local_status(wmi, from_me),
-            })
+                audio: media.is_some(),
+            };
+            Some((row, media))
         })
         .collect()
 }

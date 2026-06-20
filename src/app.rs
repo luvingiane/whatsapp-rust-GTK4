@@ -144,6 +144,13 @@ fn on_activate(app: &adw::Application) {
             }
         });
     }
+    // Voice-note playback: the play button asks the backend to fetch + decrypt it.
+    {
+        let command_tx = command_tx.clone();
+        win.thread.connect_play(move |chat_jid, id| {
+            let _ = command_tx.try_send(WaCommand::PlayAudio { chat_jid, id });
+        });
+    }
 
     // Presence: be "available" only while the window is focused AND the user is
     // active; "unavailable" when unfocused or idle, so the phone resumes its own
@@ -279,6 +286,10 @@ fn on_activate(app: &adw::Application) {
                         win_ev.archived_list.set_avatar(&jid, &tex);
                         win_ev.thread.set_avatar(&jid, &tex);
                     }
+                }
+                // A voice note finished downloading: play it.
+                WaEvent::AudioReady { path } => {
+                    win_ev.thread.play_audio(&path);
                 }
             }
         }
