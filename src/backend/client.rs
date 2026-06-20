@@ -256,7 +256,7 @@ pub async fn run(
                         match jid.parse::<whatsapp_rust::Jid>() {
                             Ok(to) => match cmd_client.send_text(to, text.clone()).await {
                                 Ok(res) => {
-                                    store_outgoing(&store, &event_tx, &dirty, jid, text, res.message_id, None).await;
+                                    store_outgoing(&store, &event_tx, &dirty, jid, text, res.message_id, None, 0, Vec::new()).await;
                                 }
                                 Err(e) => {
                                     warn!("send_text failed: {e:?}");
@@ -267,21 +267,22 @@ pub async fn run(
                         }
                     }
                 }
-                Ok(WaCommand::SendAudio { jid, ogg, duration }) => {
+                Ok(WaCommand::SendAudio { jid, ogg, duration, waveform }) => {
                     match jid.parse::<whatsapp_rust::Jid>() {
                         Ok(to) => match cmd_client.upload(ogg, MediaType::Audio, UploadOptions::default()).await {
                             Ok(up) => {
+                                let wf = if waveform.is_empty() { None } else { Some(waveform.clone()) };
                                 let msg = audio_message(up, AudioOptions {
                                     ptt: Some(true),
                                     duration_seconds: Some(duration),
                                     mimetype: None,
-                                    waveform: None,
+                                    waveform: wf,
                                 });
                                 // Keep the media proto so our own note is replayable.
                                 let media = codec::message_to_vec(&msg);
                                 match cmd_client.send_message(to, msg).await {
                                     Ok(res) => {
-                                        store_outgoing(&store, &event_tx, &dirty, jid, "🎤 Messaggio vocale".to_string(), res.message_id, Some(media)).await;
+                                        store_outgoing(&store, &event_tx, &dirty, jid, "🎤 Messaggio vocale".to_string(), res.message_id, Some(media), duration, waveform).await;
                                     }
                                     Err(e) => {
                                         warn!("send audio failed: {e:?}");
@@ -308,7 +309,7 @@ pub async fn run(
                     // Cache hit: reply at once.
                     if path.exists() {
                         let _ = event_tx
-                            .send(WaEvent::AudioReady { path: path.to_string_lossy().into_owned() })
+                            .send(WaEvent::AudioReady { id: id.clone(), path: path.to_string_lossy().into_owned() })
                             .await;
                         continue;
                     }
@@ -323,7 +324,7 @@ pub async fn run(
                                                 warn!("write voice note failed: {e:?}");
                                             } else {
                                                 let _ = event_tx
-                                                    .send(WaEvent::AudioReady { path: path.to_string_lossy().into_owned() })
+                                                    .send(WaEvent::AudioReady { id: id.clone(), path: path.to_string_lossy().into_owned() })
                                                     .await;
                                             }
                                         }
@@ -444,6 +445,8 @@ async fn store_outgoing(
     body: String,
     id: String,
     media: Option<Vec<u8>>,
+    audio_secs: u32,
+    audio_waveform: Vec<u8>,
 ) {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -459,13 +462,21 @@ async fn store_outgoing(
         body: body.clone(),
         status: 1,
         audio: media.is_some(),
+        audio_secs,
+        audio_waveform: audio_waveform.clone(),
     };
     if let Err(e) = store.insert_message(row.clone()).await {
         warn!("store_outgoing insert failed: {e:?}");
     }
     if let Some(bytes) = media {
-        if let Err(e) = store.set_media(chat.clone(), id, bytes).await {
+        if let Err(e) = store.set_media(chat.clone(), id.clone(), bytes).await {
             warn!("store_outgoing set_media failed: {e:?}");
+        }
+        if let Err(e) = store
+            .set_audio_meta(chat.clone(), id, audio_secs, audio_waveform)
+            .await
+        {
+            warn!("store_outgoing set_audio_meta failed: {e:?}");
         }
     }
     if let Err(e) = store.apply_message(chat, body, ts, true, 1).await {
@@ -594,20 +605,26 @@ async fn handle_event(
                         "history sync: storing {} messages ({from_me} ours, {with_status} already ✓✓/read)",
                         msgs.len()
                     );
-                    // Media to persist after the rows exist (voice notes).
-                    let media: Vec<(String, String, Vec<u8>)> = msgs
+                    // Media + waveform to persist after the rows exist (voice notes).
+                    #[allow(clippy::type_complexity)]
+                    let media: Vec<(String, String, Vec<u8>, u32, Vec<u8>)> = msgs
                         .iter()
                         .filter_map(|(m, media)| {
-                            media.as_ref().map(|b| (m.chat_jid.clone(), m.id.clone(), b.clone()))
+                            media.as_ref().map(|b| {
+                                (m.chat_jid.clone(), m.id.clone(), b.clone(), m.audio_secs, m.audio_waveform.clone())
+                            })
                         })
                         .collect();
                     let rows: Vec<MessageRow> = msgs.into_iter().map(|(m, _)| m).collect();
                     if let Err(e) = store.insert_messages(rows).await {
                         warn!("insert_messages failed: {e:?}");
                     }
-                    for (chat_jid, id, bytes) in media {
-                        if let Err(e) = store.set_media(chat_jid, id, bytes).await {
+                    for (chat_jid, id, bytes, secs, waveform) in media {
+                        if let Err(e) = store.set_media(chat_jid.clone(), id.clone(), bytes).await {
                             warn!("set_media (history) failed: {e:?}");
+                        }
+                        if let Err(e) = store.set_audio_meta(chat_jid, id, secs, waveform).await {
+                            warn!("set_audio_meta (history) failed: {e:?}");
                         }
                     }
                 }
@@ -645,11 +662,12 @@ async fn handle_event(
                     // Our own live message is at least server-acked → one tick;
                     // incoming messages carry no status.
                     let status = if from_me { 1 } else { 0 };
-                    // Keep the media proto for playable voice notes.
+                    // Keep the media proto + waveform for playable voice notes.
                     let audio_media = msg
                         .audio_message
                         .as_ref()
                         .map(|_| codec::message_to_vec(msg));
+                    let (audio_secs, audio_waveform) = audio_meta(msg);
                     let row = MessageRow {
                         id: info.id.clone(),
                         chat_jid: chat.clone(),
@@ -666,6 +684,8 @@ async fn handle_event(
                         body: body.clone(),
                         status,
                         audio: audio_media.is_some(),
+                        audio_secs,
+                        audio_waveform: audio_waveform.clone(),
                     };
                     // Insert first: a `false` means this is the self-fanout echo of
                     // a message we already inserted on send — skip the preview bump
@@ -682,6 +702,12 @@ async fn handle_event(
                         if let Some(bytes) = audio_media {
                             if let Err(e) = store.set_media(chat.clone(), info.id.clone(), bytes).await {
                                 warn!("set_media (live) failed: {e:?}");
+                            }
+                            if let Err(e) = store
+                                .set_audio_meta(chat.clone(), info.id.clone(), audio_secs, audio_waveform.clone())
+                                .await
+                            {
+                                warn!("set_audio_meta (live) failed: {e:?}");
                             }
                         }
                         if let Err(e) = store
@@ -994,11 +1020,12 @@ fn conv_to_messages(c: &wa::Conversation, chat: &str) -> Vec<(MessageRow, Option
                 .clone()
                 .unwrap_or_else(|| chat.to_string());
             let from_me = wmi.key.from_me.unwrap_or(false);
-            // Keep the media proto for playable voice notes.
+            // Keep the media proto for playable voice notes, plus its waveform.
             let media = msg
                 .audio_message
                 .as_ref()
                 .map(|_| codec::message_to_vec(msg));
+            let (audio_secs, audio_waveform) = audio_meta(msg);
             let row = MessageRow {
                 id,
                 chat_jid: chat.to_string(),
@@ -1011,10 +1038,21 @@ fn conv_to_messages(c: &wa::Conversation, chat: &str) -> Vec<(MessageRow, Option
                 // Delivery status from the synced WebMessageInfo (our msgs only).
                 status: wmi_local_status(wmi, from_me),
                 audio: media.is_some(),
+                audio_secs,
+                audio_waveform,
             };
             Some((row, media))
         })
         .collect()
+}
+
+/// Voice-note duration (seconds) + amplitude waveform (0..100) from a message's
+/// audio payload; `(0, empty)` for non-audio messages.
+fn audio_meta(msg: &wa::Message) -> (u32, Vec<u8>) {
+    match &msg.audio_message {
+        Some(a) => (a.seconds.unwrap_or(0), a.waveform.clone().unwrap_or_default()),
+        None => (0, Vec::new()),
+    }
 }
 
 /// Finds the most recent message **with displayable content** and returns its

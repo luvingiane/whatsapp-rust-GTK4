@@ -2,3 +2,4 @@
 
 pub mod preview;
 pub mod qr;
+pub mod text;
