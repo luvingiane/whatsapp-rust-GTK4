@@ -369,6 +369,80 @@ impl Store {
         .await?
     }
 
+    /// Collapses duplicate chats: a contact addressed once by `@lid` (before the
+    /// PN mapping was known) and once by phone number ends up as two rows. For
+    /// every `@lid` chat whose PN is known (via `lid_map`), move its messages onto
+    /// the PN chat (media follows the row), merge the chat row (newest `last_*`,
+    /// summed unread), and delete the `@lid` row + its `chat_meta`. Returns the
+    /// number of chats merged.
+    pub async fn merge_lid_duplicates(&self) -> Result<usize> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<usize> {
+            let mut guard = conn.lock().map_err(|_| anyhow!("store mutex poisoned"))?;
+            let tx = guard.transaction()?;
+            let pairs: Vec<(String, String)> = {
+                let mut stmt = tx.prepare(
+                    "SELECT lm.lid, lm.pn FROM lid_map lm JOIN chats c ON c.jid = lm.lid",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                rows
+            };
+            let mut merged = 0usize;
+            for (lid, pn) in &pairs {
+                // Move messages to the PN key (media column follows); drop any that
+                // collide on (pn,id) and the now-orphaned @lid rows.
+                tx.execute(
+                    "UPDATE OR IGNORE messages SET chat_jid=?2 WHERE chat_jid=?1",
+                    params![lid, pn],
+                )?;
+                tx.execute("DELETE FROM messages WHERE chat_jid=?1", params![lid])?;
+                // Merge the chat row into the PN one.
+                let lidrow = tx
+                    .query_row(
+                        "SELECT name,last_message,last_ts,last_from_me,unread,is_group,COALESCE(last_status,0)
+                         FROM chats WHERE jid=?1",
+                        params![lid],
+                        |r| {
+                            Ok((
+                                r.get::<_, String>(0)?,
+                                r.get::<_, String>(1)?,
+                                r.get::<_, i64>(2)?,
+                                r.get::<_, i64>(3)?,
+                                r.get::<_, i64>(4)?,
+                                r.get::<_, i64>(5)?,
+                                r.get::<_, i64>(6)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                if let Some((name, last_message, last_ts, last_from_me, unread, is_group, last_status)) =
+                    lidrow
+                {
+                    tx.execute(
+                        "INSERT INTO chats (jid,name,last_message,last_ts,last_from_me,unread,is_group,last_status)
+                         VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+                         ON CONFLICT(jid) DO UPDATE SET
+                           name=CASE WHEN chats.name='' AND excluded.name<>'' THEN excluded.name ELSE chats.name END,
+                           unread=chats.unread + excluded.unread,
+                           last_message=CASE WHEN excluded.last_ts>chats.last_ts THEN excluded.last_message ELSE chats.last_message END,
+                           last_from_me=CASE WHEN excluded.last_ts>chats.last_ts THEN excluded.last_from_me ELSE chats.last_from_me END,
+                           last_status=CASE WHEN excluded.last_ts>chats.last_ts THEN excluded.last_status ELSE chats.last_status END,
+                           last_ts=MAX(excluded.last_ts, chats.last_ts)",
+                        params![pn, name, last_message, last_ts, last_from_me, unread, is_group, last_status],
+                    )?;
+                    tx.execute("DELETE FROM chats WHERE jid=?1", params![lid])?;
+                    tx.execute("DELETE FROM chat_meta WHERE jid=?1", params![lid])?;
+                    merged += 1;
+                }
+            }
+            tx.commit()?;
+            Ok(merged)
+        })
+        .await?
+    }
+
     /// Sets the saved (address-book) name for a chat, from a `ContactAction`.
     pub async fn set_saved_name(&self, jid: String, name: String) -> Result<()> {
         if name.is_empty() {

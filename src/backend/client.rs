@@ -180,9 +180,11 @@ pub async fn run(
                     }
                 }
                 let propagated = store.propagate_lid_meta().await.unwrap_or(0);
-                if unified > 0 || propagated > 0 {
+                // Collapse @lid/PN duplicate chats now that more pairs are known.
+                let merged = store.merge_lid_duplicates().await.unwrap_or(0);
+                if unified > 0 || propagated > 0 || merged > 0 {
                     info!(
-                        "LID<->PN reconcile: {unified} via library map, {propagated} via lid_map"
+                        "LID<->PN reconcile: {unified} via library map, {propagated} via lid_map, {merged} merged"
                     );
                     dirty.notify_one();
                 }
