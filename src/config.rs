@@ -10,6 +10,14 @@ pub const APP_ID: &str = "io.github.matt.WhatsAppRustGtk";
 /// Human-readable application name shown in logs and the window title.
 pub const APP_NAME: &str = "WhatsApp (Rust/GTK4)";
 
+/// When `true`, never paint the blue (read) tick on **our own** sent messages —
+/// they stop at ✓✓ (delivered). This mirrors having "read receipts" turned OFF in
+/// WhatsApp's privacy settings: the official apps suppress the blue tick client-side
+/// in that case, but the server still delivers the read receipt, so we must hide it
+/// here too. Display-only: the stored status is untouched. Flip to `false` to show
+/// blue read ticks again.
+pub const HIDE_READ_RECEIPTS: bool = true;
+
 /// OS string advertised to WhatsApp in the device registration props. Combined
 /// with `PlatformType::Chrome` (set in the backend) it makes this client appear
 /// as "Google Chrome (Linux)" in the phone's Linked Devices list, instead of an
@@ -45,6 +53,23 @@ pub fn app_db_path() -> anyhow::Result<PathBuf> {
     data_file(APP_DB_FILE)
 }
 
+/// File holding the persisted sidebar (chat list) width in pixels, so the
+/// resizable split is restored across restarts.
+const SIDEBAR_WIDTH_FILE: &str = "sidebar_width";
+
+/// Reads the persisted sidebar width, or `None` if never set / unreadable.
+pub fn read_sidebar_width() -> Option<i32> {
+    let path = data_file(SIDEBAR_WIDTH_FILE).ok()?;
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// Persists the sidebar width (best effort; errors are ignored).
+pub fn write_sidebar_width(width: i32) {
+    if let Ok(path) = data_file(SIDEBAR_WIDTH_FILE) {
+        let _ = std::fs::write(path, width.to_string());
+    }
+}
+
 /// Resolves `<XDG data>/whatsapp-rust-gtk4/<file>`, creating the directory.
 fn data_file(file: &str) -> anyhow::Result<PathBuf> {
     let mut dir = glib::user_data_dir();
@@ -68,6 +93,19 @@ pub fn avatar_cache_path(jid: &str) -> anyhow::Result<PathBuf> {
     Ok(dir)
 }
 
+/// Returns the cache path for a downloaded media file (photo/video/document),
+/// creating the media cache directory
+/// (`~/.cache/whatsapp-rust-gtk4/media/<sanitized-id>.<ext>`). Decrypted media is
+/// cached so re-opening it doesn't re-hit the network.
+pub fn media_cache_path(id: &str, ext: &str) -> anyhow::Result<PathBuf> {
+    let mut dir = glib::user_cache_dir();
+    dir.push(DATA_SUBDIR);
+    dir.push("media");
+    std::fs::create_dir_all(&dir)?;
+    dir.push(format!("{}.{}", sanitize(id), ext));
+    Ok(dir)
+}
+
 /// Returns the cache path for a downloaded voice note, creating the audio cache
 /// directory (`~/.cache/whatsapp-rust-gtk4/audio/<sanitized-id>.ogg`). Decrypted
 /// notes are cached so replaying one doesn't re-hit the network.
@@ -77,6 +115,18 @@ pub fn audio_cache_path(id: &str) -> anyhow::Result<PathBuf> {
     dir.push("audio");
     std::fs::create_dir_all(&dir)?;
     dir.push(format!("{}.ogg", sanitize(id)));
+    Ok(dir)
+}
+
+/// Returns the cache path for a full-res profile picture (separate from the small
+/// avatar cache), creating the directory
+/// (`~/.cache/whatsapp-rust-gtk4/profile/<sanitized-jid>.jpg`).
+pub fn profile_pic_path(jid: &str) -> anyhow::Result<PathBuf> {
+    let mut dir = glib::user_cache_dir();
+    dir.push(DATA_SUBDIR);
+    dir.push("profile");
+    std::fs::create_dir_all(&dir)?;
+    dir.push(format!("{}.jpg", sanitize(jid)));
     Ok(dir)
 }
 

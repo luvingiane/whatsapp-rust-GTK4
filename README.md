@@ -28,29 +28,44 @@ This is a roadmap, not a finished feature list — it moves fast.
 
 - 📱 QR login, persistent across restarts (reconnects without re-scanning).
 - 💬 Chat list + conversations: message history (with scroll-up backfill) and live
-  messages, proper sent/received bubbles, profile-picture avatars, chat search.
-- ⌨️ Send & receive **text** in real time, with clickable links.
+  messages, proper sent/received bubbles, profile-picture avatars, chat search. New
+  messages glide in (smooth auto-scroll) and opening a chat is instant.
+- ⌨️ Send & receive **text** in real time, with clickable links and **replies/quotes**.
+- 🖼️ **Media — send & receive photos, videos and documents** (paperclip, drag-and-drop
+  or Ctrl-V, with a preview strip before sending). Inline image bubbles, a full-res
+  viewer, documents open in your default app, and a per-chat **gallery**
+  (Foto / Video / Documenti / Link) that downloads missing items on demand.
 - 🎤 **Voice notes**: record (with a live waveform + timer), send, receive, and play
   back with a waveform, progress bar and elapsed time.
-- ✔️ **Delivery / read ticks** (✓ sent, ✓✓ delivered, blue ✓✓ read) — in bubbles and as
-  a prefix in the chat-list preview.
+- 👤 **Contact & group profiles**: click the header for a panel with the big picture,
+  status/description, a media shortcut, block/unblock (1:1), and the participants
+  (group) or groups-in-common (1:1) — each clickable and resolved to the real
+  phone-number identity.
+- ✔️ **Delivery / read ticks** (✓ sent, ✓✓ delivered). The blue "read" tick on your
+  **own** sent messages is hidden to mirror WhatsApp's "read receipts off" privacy
+  setting (flip one flag to show it again).
+- 🔄 **Two-way read sync**: reading a chat here clears its unread on your phone /
+  WhatsApp Web, and reading it there clears it here.
 - 🟢 **Presence**: reports online only while the window is focused/active and "away"
   when unfocused or idle, so your phone resumes its own notifications when you step away.
-- 🗂️ **Archived chats** view with an unread count; read chats clear their unread badge
-  (incl. reads done on the phone); duplicate `@lid`/PN chats are merged.
+- 🗂️ **Archived chats** view with an unread count; read chats clear their unread badge.
+- 🧹 **Identity de-duplication**: WhatsApp's `@lid`, phone-number and multi-device
+  (`:NN`) forms of the same person are collapsed, so a contact — and their
+  messages/media — shows up once, in the chat list and in group message bubbles.
 
 **🚧 Not there yet**
 
-- 🖼️ Other media — photos, videos, GIFs, stickers, documents (send & receive). Only
-  voice notes are wired so far.
-- ⌨️ "Typing…" indicators, reactions, replies/quotes, group management.
+- 🎟️ Stickers and GIFs.
+- ⌨️ "Typing…" indicators, reactions, and full group management (creating groups,
+  adding/removing members, …).
 
 **⚠️ Known limitations**
 
-- **Archived accuracy** depends on resolving WhatsApp's LID↔phone-number identities.
-  That mapping fills in over time (and as you open chats); the bulk server lookup is
-  rate-limited, so a few archived chats can linger in the main list until their pair is
-  learned.
+- WhatsApp's **LID ↔ phone-number** mapping fills in over time (as you open chats and
+  groups; the bulk server lookup is rate-limited), so a few group members or archived
+  chats can briefly show a raw LID number until their pair is learned.
+- Very **old media** whose copy has expired on WhatsApp's servers may no longer be
+  downloadable.
 - 🪶 Goal throughout: stay light and native (one Rust process, no Chromium).
 
 ## 🤖 Heads-up: this is "vibecoded"
@@ -93,7 +108,7 @@ local state. Two things to clean up:
 2. **Your data & login (the databases)**: all session + chat state lives under
    `~/.local/share/whatsapp-rust-gtk4/` (the `whatsapp.db` session and `app.db` chat
    store) plus a cache in `~/.cache/whatsapp-rust-gtk4/` (avatars, downloaded voice
-   notes). Remove them with:
+   notes and media). Remove them with:
 
    ```bash
    rm -rf ~/.local/share/whatsapp-rust-gtk4 ~/.cache/whatsapp-rust-gtk4

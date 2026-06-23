@@ -8,4 +8,4 @@ pub mod bridge;
 pub mod client;
 pub mod runtime;
 
-pub use bridge::{channels, WaCommand, WaEvent};
+pub use bridge::{channels, MediaEntry, ReplyQuote, WaCommand, WaEvent};

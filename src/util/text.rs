@@ -38,6 +38,21 @@ pub fn linkify(text: &str) -> String {
     out
 }
 
+/// Extracts the URLs found in `text` (same recognition as [`linkify`]), in order.
+pub fn find_urls(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < text.len() {
+        if let Some(end) = url_at(text, i) {
+            out.push(text[i..end].to_string());
+            i = end;
+        } else {
+            i += text[i..].chars().next().map(char::len_utf8).unwrap_or(1);
+        }
+    }
+    out
+}
+
 /// If a URL starts at byte `start`, returns its exclusive end offset. Recognizes
 /// `http://`, `https://` and `www.` prefixes; the URL runs until whitespace, with
 /// common trailing punctuation trimmed.
