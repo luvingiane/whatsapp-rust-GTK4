@@ -32,6 +32,8 @@ mod imp {
         // Delivery status of our last message (1 sent, 2 delivered, 3 read).
         #[property(get, set)]
         pub last_status: Cell<i32>,
+        #[property(get, set)]
+        pub pinned: Cell<bool>,
         // Profile-picture paintable (a `gdk::Texture`), bound to the row's
         // Avatar `custom-image`; `None` until the picture has been downloaded.
         #[property(get, set, nullable)]
@@ -62,6 +64,7 @@ impl ChatObject {
             .property("unread", s.unread)
             .property("last-from-me", s.last_from_me)
             .property("last-status", s.last_status)
+            .property("pinned", s.pinned)
             .build()
     }
 }

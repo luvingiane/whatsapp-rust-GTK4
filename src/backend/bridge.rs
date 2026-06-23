@@ -11,6 +11,26 @@ use async_channel::{Receiver, Sender};
 
 use crate::model::{ChatSummary, MessageRow};
 
+/// A message being quoted in a reply: the quoted stanza id, its author JID (the
+/// `participant`, empty for 1:1), and the quoted preview text.
+#[derive(Debug, Clone)]
+pub struct ReplyQuote {
+    pub id: String,
+    pub sender: String,
+    pub body: String,
+}
+
+/// One media item for the profile gallery: `cached` is the on-disk path when the
+/// file was already downloaded (else the UI shows `thumb` or a placeholder).
+#[derive(Debug, Clone)]
+pub struct MediaEntry {
+    pub id: String,
+    pub name: String,
+    pub size: i64,
+    pub thumb: Vec<u8>,
+    pub cached: Option<String>,
+}
+
 /// Events flowing **from** the WhatsApp backend (Tokio thread) **to** the GTK UI.
 #[derive(Debug, Clone)]
 pub enum WaEvent {
@@ -64,6 +84,46 @@ pub enum WaEvent {
     /// A voice note (message `id`) has been downloaded + decrypted to `path` (OGG)
     /// and is ready to play (requested via [`WaCommand::PlayAudio`]).
     AudioReady { id: String, path: String },
+    /// A media file (message `id`, `kind` 1 image/2 video/4 document) has been
+    /// downloaded + decrypted to `path` and is ready to open (via
+    /// [`WaCommand::DownloadMedia`]).
+    MediaReady { kind: i32, path: String },
+    /// A photo (message `id`) downloaded for inline display is on disk at `path`.
+    InlineReady { id: String, path: String },
+    /// Profile info for the panel (requested via [`WaCommand::FetchProfile`]).
+    /// `rows` is the common-groups list (1:1) or the participants list (group),
+    /// each as `(jid, name, subtitle)` so rows are clickable. `status` is the user's
+    /// about text (1:1) or the group description; `blocked` is the 1:1 block state.
+    Profile {
+        is_group: bool,
+        jid: String,
+        title: String,
+        subtitle: String,
+        status: String,
+        pic_path: Option<String>,
+        blocked: bool,
+        rows: Vec<(String, String, String)>,
+        /// Number of media items (photos/videos/documents) in the chat.
+        media_count: usize,
+    },
+    /// The chat's media for the profile gallery (requested via
+    /// [`WaCommand::FetchChatMedia`]), grouped by kind, plus extracted links.
+    ChatMedia {
+        jid: String,
+        photos: Vec<MediaEntry>,
+        videos: Vec<MediaEntry>,
+        documents: Vec<MediaEntry>,
+        links: Vec<String>,
+    },
+    /// Online presence for the open chat, shown under the header name. For a 1:1,
+    /// `online_names` is `["online"]` when the contact is online (empty otherwise);
+    /// for a group it lists the currently-online members (`total` = participant count).
+    PresenceInfo {
+        jid: String,
+        is_group: bool,
+        online_names: Vec<String>,
+        total: usize,
+    },
 }
 
 /// Commands flowing **from** the GTK UI **to** the WhatsApp backend.
@@ -91,9 +151,13 @@ pub enum WaCommand {
     /// `false` = unavailable (unfocused or idle). When we never go unavailable the
     /// phone treats this device as active and withholds its own notifications.
     SetPresence { available: bool },
-    /// Send a text message to `jid`. The backend inserts it optimistically and
-    /// replies with [`WaEvent::NewMessage`].
-    SendText { jid: String, text: String },
+    /// Send a text message to `jid`, optionally quoting another message (`quote`).
+    /// The backend inserts it optimistically and replies with [`WaEvent::NewMessage`].
+    SendText {
+        jid: String,
+        text: String,
+        quote: Option<ReplyQuote>,
+    },
     /// Send a voice note (OGG/Opus bytes, `duration` seconds) to `jid`. The backend
     /// uploads it, sends an audio message (ptt), and replies with a NewMessage.
     SendAudio {
@@ -102,10 +166,48 @@ pub enum WaCommand {
         duration: u32,
         /// Amplitude waveform (0..100 per bar) computed while recording.
         waveform: Vec<u8>,
+        /// Optional message being quoted (reply), like [`Self::SendText`].
+        quote: Option<ReplyQuote>,
     },
     /// Download + decrypt a stored voice note for playback; the backend replies
     /// with [`WaEvent::AudioReady`] once the OGG is on disk.
     PlayAudio { chat_jid: String, id: String },
+    /// Download + decrypt a stored media message (photo/video/document); the backend
+    /// replies with [`WaEvent::MediaReady`] once the file is on disk.
+    DownloadMedia { chat_jid: String, id: String },
+    /// Lazily download a photo for inline display in its bubble (off the command
+    /// loop, deduped + throttled); the backend replies with [`WaEvent::InlineReady`].
+    LoadInline { chat_jid: String, id: String },
+    /// Send an image to `jid` (raw bytes + MIME), optionally with a caption and a
+    /// reply quote.
+    SendImage {
+        jid: String,
+        data: Vec<u8>,
+        mime: String,
+        caption: Option<String>,
+        quote: Option<ReplyQuote>,
+    },
+    /// Send a document (any non-image file) to `jid`.
+    SendDocument {
+        jid: String,
+        data: Vec<u8>,
+        mime: String,
+        file_name: String,
+        quote: Option<ReplyQuote>,
+    },
+    /// Fetch profile/group info for the header panel; the backend replies with
+    /// [`WaEvent::Profile`].
+    FetchProfile(String),
+    /// Fetch the chat's media gallery (photos/videos/documents/links); the backend
+    /// replies with [`WaEvent::ChatMedia`].
+    FetchChatMedia(String),
+    /// Archive (or unarchive) one or more chats (bulk selection). The backend sends
+    /// the app-state mutation per chat and updates the local store.
+    SetArchived { jids: Vec<String>, archived: bool },
+    /// Pin (or unpin) a chat, syncing the app-state flag to WhatsApp.
+    SetPinned { jid: String, pinned: bool },
+    /// Block (or unblock) a contact.
+    SetBlocked { jid: String, blocked: bool },
     /// Ask the backend to stop its run loop (sent when the window closes).
     Shutdown,
 }

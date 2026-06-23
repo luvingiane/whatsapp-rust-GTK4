@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::model::{ChatSummary, MessageRow};
+use crate::model::{ChatSummary, MediaItem, MessageRow};
 use crate::util::preview;
 
 /// A `chat_meta` row: (jid, archived, pinned, muted_until, saved_name).
@@ -73,6 +73,17 @@ CREATE TABLE IF NOT EXISTS messages (
   -- player UI. NULL for non-audio messages.
   audio_secs INTEGER,
   audio_waveform BLOB,
+  -- If this message quotes another: the quoted preview text + the quoted author's
+  -- JID (resolved to a name at read time). NULL when it's not a reply.
+  reply_text TEXT,
+  reply_sender TEXT,
+  -- Media metadata (the proto itself is in `media`): kind 0 none/1 image/2 video/
+  -- 3 audio/4 document/5 sticker, MIME, document name, and a small JPEG thumbnail.
+  media_kind INTEGER NOT NULL DEFAULT 0,
+  media_mime TEXT,
+  media_name TEXT,
+  media_thumb BLOB,
+  media_size INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (chat_jid, id)
 );
 CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages(chat_jid, ts);
@@ -88,6 +99,13 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE messages ADD COLUMN media BLOB",
     "ALTER TABLE messages ADD COLUMN audio_secs INTEGER",
     "ALTER TABLE messages ADD COLUMN audio_waveform BLOB",
+    "ALTER TABLE messages ADD COLUMN reply_text TEXT",
+    "ALTER TABLE messages ADD COLUMN reply_sender TEXT",
+    "ALTER TABLE messages ADD COLUMN media_kind INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE messages ADD COLUMN media_mime TEXT",
+    "ALTER TABLE messages ADD COLUMN media_name TEXT",
+    "ALTER TABLE messages ADD COLUMN media_thumb BLOB",
+    "ALTER TABLE messages ADD COLUMN media_size INTEGER NOT NULL DEFAULT 0",
 ];
 
 /// Run on every open. (1) Baseline ✓ for our own messages that lack a status.
@@ -103,6 +121,25 @@ const BACKFILL: &[&str] = &[
      ), last_status)
      WHERE last_from_me=1",
 ];
+
+/// Restricts a SQLite DB (and its `-wal`/`-shm` sidecars) to owner-only (0600).
+/// SQLite stores everything in plaintext, so this keeps other local users from
+/// reading the session keys / chat history. Best-effort; Unix-only.
+#[cfg(unix)]
+pub fn restrict_db_perms(path: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    for suffix in ["", "-wal", "-shm"] {
+        let p = format!("{path}{suffix}");
+        if let Ok(meta) = std::fs::metadata(&p) {
+            let mut perm = meta.permissions();
+            perm.set_mode(0o600);
+            let _ = std::fs::set_permissions(&p, perm);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub fn restrict_db_perms(_path: &str) {}
 
 /// An owned chat row to upsert. We extract these from the (borrowed) protobuf on
 /// the async side so the values can move into `spawn_blocking`.
@@ -151,6 +188,10 @@ impl Store {
             for sql in BACKFILL {
                 conn.execute(sql, [])?;
             }
+            // The DB holds chat history + media in plaintext (SQLite is not
+            // encrypted at rest); restrict it to the owner so other local users
+            // can't read it. Best-effort, Unix-only.
+            restrict_db_perms(&path);
             Ok(conn)
         })
         .await??;
@@ -449,6 +490,215 @@ impl Store {
         .await?
     }
 
+    /// Collapses device-suffixed sender JIDs (`user:NN@server`) on existing messages
+    /// to their base (`user@server`), so a group member who posted from several
+    /// devices stops showing as duplicate "users" and matches the contact-name join.
+    /// Idempotent. Returns the number of rows rewritten.
+    pub async fn normalize_message_senders(&self) -> Result<usize> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<usize> {
+            let guard = conn.lock().map_err(|_| anyhow!("store mutex poisoned"))?;
+            // For `user:NN@server`, keep `user` (before ':') + `@server` (from '@').
+            let n = guard.execute(
+                "UPDATE messages
+                 SET sender_jid = substr(sender_jid, 1, instr(sender_jid, ':') - 1)
+                                  || substr(sender_jid, instr(sender_jid, '@'))
+                 WHERE sender_jid LIKE '%:%@%'
+                   AND instr(sender_jid, ':') < instr(sender_jid, '@')",
+                [],
+            )?;
+            Ok(n)
+        })
+        .await?
+    }
+
+    /// If the chat has unread incoming messages, returns the latest incoming
+    /// message's `(id, sender_jid)` — the target for a read receipt that tells our
+    /// other devices the chat was read here (the same read-self fanout we receive
+    /// when reading on WhatsApp Web). `None` if nothing unread.
+    pub async fn read_receipt_target(&self, chat: String) -> Result<Option<(String, String)>> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<Option<(String, String)>> {
+            let guard = conn.lock().map_err(|_| anyhow!("store mutex poisoned"))?;
+            let unread: i64 = guard
+                .query_row("SELECT unread FROM chats WHERE jid=?1", params![chat], |r| {
+                    r.get(0)
+                })
+                .optional()?
+                .unwrap_or(0);
+            if unread <= 0 {
+                return Ok(None);
+            }
+            let row = guard
+                .query_row(
+                    "SELECT id, sender_jid FROM messages
+                     WHERE chat_jid=?1 AND from_me=0
+                     ORDER BY ts DESC, id DESC LIMIT 1",
+                    params![chat],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            Ok(row)
+        })
+        .await?
+    }
+
+    /// Returns the distinct chat JIDs that own any of the given message ids. Used to
+    /// resolve which conversation a read-self receipt refers to (its `chat` field is
+    /// our own reading device, not the conversation).
+    pub async fn chats_for_messages(&self, ids: Vec<String>) -> Result<Vec<String>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
+            let guard = conn.lock().map_err(|_| anyhow!("store mutex poisoned"))?;
+            let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql =
+                format!("SELECT DISTINCT chat_jid FROM messages WHERE id IN ({placeholders})");
+            let mut stmt = guard.prepare(&sql)?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(ids.iter()), |r| {
+                    r.get::<_, String>(0)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await?
+    }
+
+    /// Returns the stored display name of a chat row (group subject / name), or an
+    /// empty string if the row is absent or unnamed.
+    pub async fn chat_name(&self, jid: String) -> Result<String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<String> {
+            let guard = conn.lock().map_err(|_| anyhow!("store mutex poisoned"))?;
+            let name = guard
+                .query_row("SELECT name FROM chats WHERE jid=?1", params![jid], |r| {
+                    r.get::<_, String>(0)
+                })
+                .optional()?
+                .unwrap_or_default();
+            Ok(name)
+        })
+        .await?
+    }
+
+    /// Number of media messages (photos/videos/documents) in a chat.
+    pub async fn chat_media_count(&self, jid: String) -> Result<usize> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<usize> {
+            let guard = conn.lock().map_err(|_| anyhow!("store mutex poisoned"))?;
+            let n: i64 = guard.query_row(
+                "SELECT COUNT(*) FROM messages WHERE chat_jid=?1 AND media_kind IN (1,2,4)",
+                params![jid],
+                |r| r.get(0),
+            )?;
+            Ok(n as usize)
+        })
+        .await?
+    }
+
+    /// All media messages of a chat (photos/videos/documents), newest first.
+    pub async fn chat_media(&self, jid: String) -> Result<Vec<MediaItem>> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<MediaItem>> {
+            let guard = conn.lock().map_err(|_| anyhow!("store mutex poisoned"))?;
+            let mut stmt = guard.prepare(
+                "SELECT id, media_kind, media_mime, media_name, media_size, media_thumb
+                 FROM messages WHERE chat_jid=?1 AND media_kind IN (1,2,4)
+                 ORDER BY ts DESC, id DESC",
+            )?;
+            let rows = stmt
+                .query_map(params![jid], |r| {
+                    Ok(MediaItem {
+                        id: r.get(0)?,
+                        kind: r.get::<_, i64>(1)? as i32,
+                        mime: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                        name: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                        size: r.get(4)?,
+                        thumb: r.get::<_, Option<Vec<u8>>>(5)?.unwrap_or_default(),
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await?
+    }
+
+    /// Message bodies of a chat that likely contain a URL (newest first), for the
+    /// profile's Links tab. URL extraction happens in the caller.
+    pub async fn chat_link_bodies(&self, jid: String) -> Result<Vec<String>> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
+            let guard = conn.lock().map_err(|_| anyhow!("store mutex poisoned"))?;
+            let mut stmt = guard.prepare(
+                "SELECT body FROM messages
+                 WHERE chat_jid=?1 AND (body LIKE '%http%' OR body LIKE '%www.%')
+                 ORDER BY ts DESC, id DESC",
+            )?;
+            let rows = stmt
+                .query_map(params![jid], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await?
+    }
+
+    /// Stores a group's subject as its chat name (no-op for an empty subject so we
+    /// never blank an existing name).
+    pub async fn set_group_subject(&self, jid: String, subject: String) -> Result<()> {
+        if subject.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let guard = conn.lock().map_err(|_| anyhow!("store mutex poisoned"))?;
+            guard.execute(
+                "UPDATE chats SET name=?2 WHERE jid=?1",
+                params![jid, subject],
+            )?;
+            Ok(())
+        })
+        .await?
+    }
+
+    /// Active (non-archived, non-empty-preview) group chats with no stored name —
+    /// candidates for a one-shot subject fetch so the list shows their real name.
+    pub async fn unnamed_active_groups(&self) -> Result<Vec<String>> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
+            let guard = conn.lock().map_err(|_| anyhow!("store mutex poisoned"))?;
+            let mut stmt = guard.prepare(
+                "SELECT c.jid FROM chats c
+                 LEFT JOIN chat_meta m ON m.jid = c.jid
+                 WHERE c.jid LIKE '%@g.us' AND c.name='' AND c.last_message<>''
+                   AND COALESCE(m.archived,0)=0",
+            )?;
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await?
+    }
+
+    /// Returns the JIDs of every `@lid`-keyed chat row. Used by the reconcile loop
+    /// to ask the library for each one's PN and learn the pair, so
+    /// [`Self::merge_lid_duplicates`] can collapse the duplicate.
+    pub async fn lid_chats(&self) -> Result<Vec<String>> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
+            let guard = conn.lock().map_err(|_| anyhow!("store mutex poisoned"))?;
+            let mut stmt = guard.prepare("SELECT jid FROM chats WHERE jid LIKE '%@lid'")?;
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await?
+    }
+
     /// Sets the saved (address-book) name for a chat, from a `ContactAction`.
     pub async fn set_saved_name(&self, jid: String, name: String) -> Result<()> {
         if name.is_empty() {
@@ -661,6 +911,31 @@ impl Store {
         .await?
     }
 
+    /// Stores media metadata (kind/MIME/name/thumbnail) for a downloadable media
+    /// message. The proto itself is stored separately via [`Self::set_media`].
+    pub async fn set_media_meta(
+        &self,
+        chat_jid: String,
+        id: String,
+        kind: i32,
+        mime: String,
+        name: String,
+        thumb: Vec<u8>,
+        size: i64,
+    ) -> Result<()> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let guard = conn.lock().map_err(|_| anyhow!("store mutex poisoned"))?;
+            guard.execute(
+                "UPDATE messages SET media_kind=?3, media_mime=?4, media_name=?5, media_thumb=?6, media_size=?7
+                 WHERE chat_jid=?1 AND id=?2",
+                params![chat_jid, id, kind, mime, name, thumb, size],
+            )?;
+            Ok(())
+        })
+        .await?
+    }
+
     /// Stores a voice note's duration + waveform for the player UI. Idempotent.
     pub async fn set_audio_meta(
         &self,
@@ -677,6 +952,47 @@ impl Store {
                 params![chat_jid, id, secs, waveform],
             )?;
             Ok(())
+        })
+        .await?
+    }
+
+    /// Stores the quote info for a reply message (the quoted preview text + the
+    /// quoted author's JID), for rendering the quote block. Idempotent.
+    pub async fn set_reply(
+        &self,
+        chat_jid: String,
+        id: String,
+        sender: String,
+        text: String,
+    ) -> Result<()> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let guard = conn.lock().map_err(|_| anyhow!("store mutex poisoned"))?;
+            guard.execute(
+                "UPDATE messages SET reply_text=?3, reply_sender=?4 WHERE chat_jid=?1 AND id=?2",
+                params![chat_jid, id, text, sender],
+            )?;
+            Ok(())
+        })
+        .await?
+    }
+
+    /// Resolves a display name for `jid` (saved address-book name → contact
+    /// pushname), or empty if unknown.
+    pub async fn display_name(&self, jid: String) -> Result<String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<String> {
+            let guard = conn.lock().map_err(|_| anyhow!("store mutex poisoned"))?;
+            let name = guard
+                .query_row(
+                    "SELECT COALESCE(NULLIF((SELECT saved_name FROM chat_meta WHERE jid=?1),''),
+                                     NULLIF((SELECT name FROM contacts WHERE jid=?1),''), '')",
+                    params![jid],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?
+                .unwrap_or_default();
+            Ok(name)
         })
         .await?
     }
@@ -708,17 +1024,32 @@ impl Store {
             // author labels; empty → the UI falls back to the number. Order by
             // (ts,id) — the same key the backfill cursor pages on (load_messages_before).
             let mut stmt = guard.prepare(
-                "SELECT x.id, x.sender_jid,
-                        COALESCE(NULLIF(cm.saved_name,''), NULLIF(ct.name,''), '') AS sender_name,
-                        x.from_me, x.ts, x.body, x.status, (x.media IS NOT NULL) AS audio,
-                        x.audio_secs, x.audio_waveform
+                "SELECT x.id, COALESCE(slm.pn, x.sender_jid) AS sender_jid,
+                        COALESCE(NULLIF(cm.saved_name,''), NULLIF(ct.name,''),
+                                 NULLIF(scm2.saved_name,''), NULLIF(sct2.name,''), '') AS sender_name,
+                        x.from_me, x.ts, x.body, x.status,
+                        (x.media_kind=3 OR (x.media_kind=0 AND x.media IS NOT NULL)) AS audio,
+                        x.audio_secs, x.audio_waveform, x.reply_text,
+                        COALESCE(rlm.pn, x.reply_sender) AS reply_sender_canon,
+                        COALESCE(NULLIF(rcm.saved_name,''), NULLIF(rct.name,''),
+                                 NULLIF(rcm2.saved_name,''), NULLIF(rct2.name,''), '') AS reply_sender_name,
+                        x.media_kind, x.media_mime, x.media_name, x.media_thumb, x.media_size
                  FROM (
-                   SELECT id, sender_jid, from_me, ts, body, status, media, audio_secs, audio_waveform
+                   SELECT id, sender_jid, from_me, ts, body, status, media, audio_secs, audio_waveform, reply_text, reply_sender,
+                          media_kind, media_mime, media_name, media_thumb, media_size
                    FROM messages WHERE chat_jid=?1
                    ORDER BY ts DESC, id DESC LIMIT ?2
                  ) x
                  LEFT JOIN chat_meta cm ON cm.jid = x.sender_jid
                  LEFT JOIN contacts  ct ON ct.jid = x.sender_jid
+                 LEFT JOIN lid_map  slm ON slm.lid = x.sender_jid
+                 LEFT JOIN chat_meta scm2 ON scm2.jid = slm.pn
+                 LEFT JOIN contacts  sct2 ON sct2.jid = slm.pn
+                 LEFT JOIN lid_map  rlm ON rlm.lid = x.reply_sender
+                 LEFT JOIN chat_meta rcm ON rcm.jid = x.reply_sender
+                 LEFT JOIN contacts  rct ON rct.jid = x.reply_sender
+                 LEFT JOIN chat_meta rcm2 ON rcm2.jid = rlm.pn
+                 LEFT JOIN contacts  rct2 ON rct2.jid = rlm.pn
                  ORDER BY x.ts ASC, x.id ASC",
             )?;
             let rows = stmt
@@ -735,6 +1066,30 @@ impl Store {
                         audio: r.get::<_, i64>(7)? != 0,
                         audio_secs: r.get::<_, Option<i64>>(8)?.unwrap_or(0) as u32,
                         audio_waveform: r.get::<_, Option<Vec<u8>>>(9)?.unwrap_or_default(),
+                        reply_text: r.get::<_, Option<String>>(10)?.unwrap_or_default(),
+                        reply_sender_name: {
+                            let has_quote = r
+                                .get::<_, Option<String>>(10)?
+                                .map(|s| !s.is_empty())
+                                .unwrap_or(false);
+                            if !has_quote {
+                                String::new()
+                            } else {
+                                let resolved: String = r.get(12)?;
+                                if resolved.is_empty() {
+                                    r.get::<_, Option<String>>(11)?
+                                        .map(|j| preview::pretty_number(&j))
+                                        .unwrap_or_default()
+                                } else {
+                                    resolved
+                                }
+                            }
+                        },
+                        media_kind: r.get::<_, i64>(13)? as i32,
+                        media_mime: r.get::<_, Option<String>>(14)?.unwrap_or_default(),
+                        media_name: r.get::<_, Option<String>>(15)?.unwrap_or_default(),
+                        media_thumb: r.get::<_, Option<Vec<u8>>>(16)?.unwrap_or_default(),
+                        media_size: r.get::<_, i64>(17)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -759,18 +1114,33 @@ impl Store {
             // Keyset pagination on (ts,id): strictly older than the cursor, matching
             // the (ts DESC, id DESC) ordering used by load_messages.
             let mut stmt = guard.prepare(
-                "SELECT x.id, x.sender_jid,
-                        COALESCE(NULLIF(cm.saved_name,''), NULLIF(ct.name,''), '') AS sender_name,
-                        x.from_me, x.ts, x.body, x.status, (x.media IS NOT NULL) AS audio,
-                        x.audio_secs, x.audio_waveform
+                "SELECT x.id, COALESCE(slm.pn, x.sender_jid) AS sender_jid,
+                        COALESCE(NULLIF(cm.saved_name,''), NULLIF(ct.name,''),
+                                 NULLIF(scm2.saved_name,''), NULLIF(sct2.name,''), '') AS sender_name,
+                        x.from_me, x.ts, x.body, x.status,
+                        (x.media_kind=3 OR (x.media_kind=0 AND x.media IS NOT NULL)) AS audio,
+                        x.audio_secs, x.audio_waveform, x.reply_text,
+                        COALESCE(rlm.pn, x.reply_sender) AS reply_sender_canon,
+                        COALESCE(NULLIF(rcm.saved_name,''), NULLIF(rct.name,''),
+                                 NULLIF(rcm2.saved_name,''), NULLIF(rct2.name,''), '') AS reply_sender_name,
+                        x.media_kind, x.media_mime, x.media_name, x.media_thumb, x.media_size
                  FROM (
-                   SELECT id, sender_jid, from_me, ts, body, status, media, audio_secs, audio_waveform
+                   SELECT id, sender_jid, from_me, ts, body, status, media, audio_secs, audio_waveform, reply_text, reply_sender,
+                          media_kind, media_mime, media_name, media_thumb, media_size
                    FROM messages
                    WHERE chat_jid=?1 AND (ts < ?2 OR (ts = ?2 AND id < ?3))
                    ORDER BY ts DESC, id DESC LIMIT ?4
                  ) x
                  LEFT JOIN chat_meta cm ON cm.jid = x.sender_jid
                  LEFT JOIN contacts  ct ON ct.jid = x.sender_jid
+                 LEFT JOIN lid_map  slm ON slm.lid = x.sender_jid
+                 LEFT JOIN chat_meta scm2 ON scm2.jid = slm.pn
+                 LEFT JOIN contacts  sct2 ON sct2.jid = slm.pn
+                 LEFT JOIN lid_map  rlm ON rlm.lid = x.reply_sender
+                 LEFT JOIN chat_meta rcm ON rcm.jid = x.reply_sender
+                 LEFT JOIN contacts  rct ON rct.jid = x.reply_sender
+                 LEFT JOIN chat_meta rcm2 ON rcm2.jid = rlm.pn
+                 LEFT JOIN contacts  rct2 ON rct2.jid = rlm.pn
                  ORDER BY x.ts ASC, x.id ASC",
             )?;
             let rows = stmt
@@ -787,6 +1157,30 @@ impl Store {
                         audio: r.get::<_, i64>(7)? != 0,
                         audio_secs: r.get::<_, Option<i64>>(8)?.unwrap_or(0) as u32,
                         audio_waveform: r.get::<_, Option<Vec<u8>>>(9)?.unwrap_or_default(),
+                        reply_text: r.get::<_, Option<String>>(10)?.unwrap_or_default(),
+                        reply_sender_name: {
+                            let has_quote = r
+                                .get::<_, Option<String>>(10)?
+                                .map(|s| !s.is_empty())
+                                .unwrap_or(false);
+                            if !has_quote {
+                                String::new()
+                            } else {
+                                let resolved: String = r.get(12)?;
+                                if resolved.is_empty() {
+                                    r.get::<_, Option<String>>(11)?
+                                        .map(|j| preview::pretty_number(&j))
+                                        .unwrap_or_default()
+                                } else {
+                                    resolved
+                                }
+                            }
+                        },
+                        media_kind: r.get::<_, i64>(13)? as i32,
+                        media_mime: r.get::<_, Option<String>>(14)?.unwrap_or_default(),
+                        media_name: r.get::<_, Option<String>>(15)?.unwrap_or_default(),
+                        media_thumb: r.get::<_, Option<Vec<u8>>>(16)?.unwrap_or_default(),
+                        media_size: r.get::<_, i64>(17)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;

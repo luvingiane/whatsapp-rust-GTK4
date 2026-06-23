@@ -8,6 +8,9 @@ use std::rc::Rc;
 pub mod chat_list;
 pub mod chat_object;
 pub mod login;
+pub mod media_grid;
+pub mod media_viewer;
+pub mod profile;
 pub mod thread;
 pub mod window;
 
