@@ -1,1 +1,5 @@
 /target
+
+# Local working files (not part of the project)
+/.claude/
+/handoff.md

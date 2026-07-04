@@ -30,16 +30,26 @@ This is a roadmap, not a finished feature list — it moves fast.
 - 💬 Chat list + conversations: message history (with scroll-up backfill) and live
   messages, proper sent/received bubbles, profile-picture avatars, chat search. New
   messages glide in (smooth auto-scroll) and opening a chat is instant.
-- ⌨️ Send & receive **text** in real time, with clickable links and **replies/quotes**.
-- 🖼️ **Media — send & receive photos, videos and documents** (paperclip, drag-and-drop
-  or Ctrl-V, with a preview strip before sending). Inline image bubbles, a full-res
-  viewer, documents open in your default app, and a per-chat **gallery**
-  (Foto / Video / Documenti / Link) that downloads missing items on demand.
+- ⌨️ Send & receive **text** in real time, with clickable links, **replies/quotes** and
+  **link previews** (rich cards, fetched on send and shown on receive).
+- ✍️ **Message actions** (right-click / long-press a bubble): **edit** your own recent
+  texts, **delete** for me or for everyone (revoke), **forward** to another chat (with a
+  searchable chat picker), and **copy text** — with edits/revokes syncing live both ways.
+- 🖼️ **Media — send & receive photos, videos, GIFs and documents** (paperclip,
+  drag-and-drop, or Ctrl-V that pastes a screenshot as an image and a copied file as an
+  attachment, with a preview strip before sending). Inline image bubbles, GIFs shown apart
+  from videos (and looped), and documents opening in your real default app.
+- 🔍 A **full-window media viewer** (Telegram-style): dark backdrop, zoom/pan, the chat
+  name + date, **left/right navigation** (on-screen arrows or keyboard) through the chat's
+  media, and forward / copy / save / delete right there.
+- 🗂️ A **side pane** (slides in from the right — no extra windows) with the profile and a
+  per-chat **gallery** (Foto / Video / Documenti / Link, with link cards) that downloads
+  missing items on demand.
 - 🎤 **Voice notes**: record (with a live waveform + timer), send, receive, and play
   back with a waveform, progress bar and elapsed time.
-- 👤 **Contact & group profiles**: click the header for a panel with the big picture,
-  status/description, a media shortcut, block/unblock (1:1), and the participants
-  (group) or groups-in-common (1:1) — each clickable and resolved to the real
+- 👤 **Contact & group profiles**: click the header for the side pane's profile page —
+  big picture, status/description, a media shortcut, block/unblock (1:1), and the
+  participants (group) or groups-in-common (1:1), each clickable and resolved to the real
   phone-number identity.
 - ✔️ **Delivery / read ticks** (✓ sent, ✓✓ delivered). The blue "read" tick on your
   **own** sent messages is hidden to mirror WhatsApp's "read receipts off" privacy
@@ -55,7 +65,8 @@ This is a roadmap, not a finished feature list — it moves fast.
 
 **🚧 Not there yet**
 
-- 🎟️ Stickers and GIFs.
+- 🎟️ Stickers, and a **GIF/sticker picker** to *send* them (incoming GIFs already display
+  and loop; there's just no picker to compose new ones yet).
 - ⌨️ "Typing…" indicators, reactions, and full group management (creating groups,
   adding/removing members, …).
 

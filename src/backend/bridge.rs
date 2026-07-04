@@ -25,9 +25,14 @@ pub struct ReplyQuote {
 #[derive(Debug, Clone)]
 pub struct MediaEntry {
     pub id: String,
+    /// Media kind (1 image, 2 video, 4 document, 6 gif).
+    pub kind: i32,
+    pub mime: String,
     pub name: String,
     pub size: i64,
     pub thumb: Vec<u8>,
+    /// Message unix timestamp (seconds).
+    pub ts: i64,
     pub cached: Option<String>,
 }
 
@@ -84,10 +89,21 @@ pub enum WaEvent {
     /// A voice note (message `id`) has been downloaded + decrypted to `path` (OGG)
     /// and is ready to play (requested via [`WaCommand::PlayAudio`]).
     AudioReady { id: String, path: String },
-    /// A media file (message `id`, `kind` 1 image/2 video/4 document) has been
+    /// A media file (`kind` 1 image/2 video/4 document/6 gif) has been
     /// downloaded + decrypted to `path` and is ready to open (via
-    /// [`WaCommand::DownloadMedia`]).
-    MediaReady { kind: i32, path: String },
+    /// [`WaCommand::DownloadMedia`]). Carries the message coordinates and
+    /// metadata the full-window viewer displays/needs (`ts`, `from_me`), plus
+    /// the chat's visual media `(id, kind)` oldest-first for left/right
+    /// navigation (empty for documents).
+    MediaReady {
+        chat_jid: String,
+        id: String,
+        kind: i32,
+        path: String,
+        ts: i64,
+        from_me: bool,
+        siblings: Vec<(String, i32)>,
+    },
     /// A photo (message `id`) downloaded for inline display is on disk at `path`.
     InlineReady { id: String, path: String },
     /// Profile info for the panel (requested via [`WaCommand::FetchProfile`]).
@@ -107,13 +123,14 @@ pub enum WaEvent {
         media_count: usize,
     },
     /// The chat's media for the profile gallery (requested via
-    /// [`WaCommand::FetchChatMedia`]), grouped by kind, plus extracted links.
+    /// [`WaCommand::FetchChatMedia`]), grouped by kind, plus shared links
+    /// (stored previews first, bare URLs from older messages appended).
     ChatMedia {
         jid: String,
         photos: Vec<MediaEntry>,
         videos: Vec<MediaEntry>,
         documents: Vec<MediaEntry>,
-        links: Vec<String>,
+        links: Vec<crate::model::LinkItem>,
     },
     /// Online presence for the open chat, shown under the header name. For a 1:1,
     /// `online_names` is `["online"]` when the contact is online (empty otherwise);
@@ -124,6 +141,12 @@ pub enum WaEvent {
         online_names: Vec<String>,
         total: usize,
     },
+    /// A message changed in place (edited or revoked, by us or a peer); `row` is
+    /// re-read from the store. The UI rebuilds its bubble if the chat is open.
+    MessageUpdated { row: MessageRow },
+    /// A message was deleted locally ("elimina per me"). The UI drops its bubble
+    /// if the chat is open.
+    MessageDeleted { chat_jid: String, id: String },
 }
 
 /// Commands flowing **from** the GTK UI **to** the WhatsApp backend.
@@ -133,9 +156,11 @@ pub enum WaEvent {
 /// modules only need to add variants and a match arm.
 #[derive(Debug, Clone)]
 pub enum WaCommand {
-    /// Load a chat's message history; the backend replies with
-    /// [`WaEvent::ChatHistory`].
-    OpenChat(String),
+    /// Open a chat: clear its unread badge, sync read-state and subscribe to
+    /// presence. With `with_history` the backend also replies with
+    /// [`WaEvent::ChatHistory`]; the UI passes `false` when it rendered from
+    /// its own history cache.
+    OpenChat { jid: String, with_history: bool },
     /// Load the page of messages older than the keyset cursor `(before_ts,
     /// before_id)` for `jid`; the backend replies with [`WaEvent::OlderHistory`].
     LoadOlder {
@@ -208,6 +233,26 @@ pub enum WaCommand {
     SetPinned { jid: String, pinned: bool },
     /// Block (or unblock) a contact.
     SetBlocked { jid: String, blocked: bool },
+    /// Edit one of our sent messages (within WhatsApp's 15-minute window). The
+    /// backend replies with [`WaEvent::MessageUpdated`].
+    EditMessage {
+        jid: String,
+        id: String,
+        new_text: String,
+    },
+    /// Delete one of our messages for everyone (revoke). The backend replies
+    /// with [`WaEvent::MessageUpdated`] (tombstone row).
+    RevokeMessage { jid: String, id: String },
+    /// Delete a message locally only ("elimina per me"). No network traffic;
+    /// the backend replies with [`WaEvent::MessageDeleted`].
+    DeleteLocal { jid: String, id: String },
+    /// Forward message `id` of `chat_jid` to `to_jid` (text is re-sent, media is
+    /// relayed from the same CDN blob without re-uploading).
+    ForwardMessage {
+        to_jid: String,
+        chat_jid: String,
+        id: String,
+    },
     /// Ask the backend to stop its run loop (sent when the window closes).
     Shutdown,
 }

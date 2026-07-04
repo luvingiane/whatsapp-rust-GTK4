@@ -60,6 +60,13 @@ type ReplyState = Rc<RefCell<Option<(String, String, String, String)>>>;
 type SendAudioCb =
     Rc<RefCell<Option<Box<dyn Fn(Vec<u8>, u32, Vec<u8>, Option<(String, String, String)>)>>>>;
 type PlayCb = Rc<RefCell<Option<Box<dyn Fn(String, String)>>>>;
+/// `(msg_id, new_text)` when an edit is confirmed from the composer.
+type EditCb = Rc<RefCell<Option<Box<dyn Fn(String, String)>>>>;
+/// `(msg_id)` when "Inoltra" is chosen from the context menu.
+type ForwardCb = Rc<RefCell<Option<Box<dyn Fn(String)>>>>;
+/// `(msg_id, can_revoke)` when "Elimina" is chosen (`can_revoke` = own,
+/// not-yet-revoked message, so "elimina per tutti" is offered).
+type DeleteCb = Rc<RefCell<Option<Box<dyn Fn(String, bool)>>>>;
 
 /// On-screen pieces of a voice-note bubble, so playback can drive its waveform
 /// fill, time label and play/pause icon.
@@ -211,6 +218,16 @@ pub struct ThreadView {
     /// The reply banner above the composer + its preview label (shown while replying).
     reply_banner: gtk::Box,
     reply_banner_label: gtk::Label,
+    /// Message id → its outermost row widget in `list`, so an edit/revoke can
+    /// rebuild the bubble in place and a local delete can remove it.
+    bubbles: Rc<RefCell<HashMap<String, gtk::Widget>>>,
+    /// Id of the message being edited in the composer (if any). Mutually
+    /// exclusive with `reply`.
+    edit: Rc<RefCell<Option<String>>>,
+    edit_banner: gtk::Box,
+    on_edit: EditCb,
+    on_forward: ForwardCb,
+    on_delete: DeleteCb,
     /// Day key (`day_key`) of the last appended message, so live appends know when
     /// to insert a new date separator. Reset on clear.
     last_day: Rc<RefCell<Option<i64>>>,
@@ -415,10 +432,42 @@ impl ThreadView {
         reply_banner.append(&reply_banner_label);
         reply_banner.append(&reply_cancel);
 
+        // Edit banner (twin of the reply banner, shown while editing a message).
+        let edit: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let on_edit: EditCb = Rc::new(RefCell::new(None));
+        let edit_banner = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(8)
+            .margin_start(6)
+            .margin_end(6)
+            .margin_top(4)
+            .build();
+        edit_banner.add_css_class("reply-banner");
+        edit_banner.set_visible(false);
+        let edit_banner_label = gtk::Label::builder()
+            .label("✏️ Modifica messaggio")
+            .xalign(0.0)
+            .hexpand(true)
+            .build();
+        let edit_cancel = gtk::Button::from_icon_name("window-close-symbolic");
+        edit_cancel.add_css_class("flat");
+        edit_banner.append(&edit_banner_label);
+        edit_banner.append(&edit_cancel);
+
         let entry = gtk::Entry::builder()
             .hexpand(true)
             .placeholder_text("Scrivi un messaggio")
             .build();
+        {
+            let edit = edit.clone();
+            let edit_banner = edit_banner.clone();
+            let entry = entry.clone();
+            edit_cancel.connect_clicked(move |_| {
+                *edit.borrow_mut() = None;
+                edit_banner.set_visible(false);
+                entry.set_text("");
+            });
+        }
         let mic = gtk::Button::from_icon_name("audio-input-microphone-symbolic");
         mic.add_css_class("flat");
         mic.add_css_class("mic-big");
@@ -435,13 +484,21 @@ impl ThreadView {
         let pending: Rc<RefCell<Vec<PendingAttachment>>> = Rc::new(RefCell::new(Vec::new()));
         let attach_strip = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
-            .spacing(6)
+            .spacing(8)
             .margin_start(6)
             .margin_end(6)
-            .margin_top(4)
+            .margin_top(6)
+            .margin_bottom(2)
             .build();
         attach_strip.add_css_class("attach-strip");
-        attach_strip.set_visible(false);
+        // Horizontal scroller so many staged files scroll instead of widening
+        // the window.
+        let attach_scroll = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Automatic)
+            .vscrollbar_policy(gtk::PolicyType::Never)
+            .child(&attach_strip)
+            .build();
+        attach_scroll.set_visible(false);
 
         // The send button shows when there's text OR a staged attachment.
         let update_send_vis: Rc<dyn Fn()> = {
@@ -463,9 +520,11 @@ impl ThreadView {
         }
 
         // Rebuild the preview strip from `pending` (late-bound so each ✕ can call it).
-        let rebuild_holder: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
+        type RebuildHolder = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
+        let rebuild_holder: RebuildHolder = Rc::new(RefCell::new(None));
         let rebuild_attach: Rc<dyn Fn()> = {
             let strip = attach_strip.clone();
+            let scroll = attach_scroll.clone();
             let pending = pending.clone();
             let update = update_send_vis.clone();
             let holder = rebuild_holder.clone();
@@ -474,7 +533,7 @@ impl ThreadView {
                     strip.remove(&c);
                 }
                 let items = pending.borrow().clone();
-                strip.set_visible(!items.is_empty());
+                scroll.set_visible(!items.is_empty());
                 for (i, att) in items.iter().enumerate() {
                     let item = build_attach_item(att);
                     let x = gtk::Button::from_icon_name("window-close-symbolic");
@@ -562,8 +621,24 @@ impl ThreadView {
             let reply_banner = reply_banner.clone();
             let pending = pending.clone();
             let rebuild = rebuild_attach.clone();
+            let edit = edit.clone();
+            let edit_banner = edit_banner.clone();
+            let on_edit = on_edit.clone();
             move || {
                 let text = entry.text().to_string();
+                // An in-progress edit hijacks the send: confirm it and stop.
+                if edit.borrow().is_some() {
+                    if text.trim().is_empty() {
+                        return;
+                    }
+                    let id = edit.borrow_mut().take().unwrap();
+                    edit_banner.set_visible(false);
+                    if let Some(cb) = on_edit.borrow().as_ref() {
+                        cb(id, text);
+                    }
+                    entry.set_text("");
+                    return;
+                }
                 let atts: Vec<PendingAttachment> = pending.borrow_mut().drain(..).collect();
                 if atts.is_empty() && text.trim().is_empty() {
                     return;
@@ -761,49 +836,68 @@ impl ThreadView {
             });
             scrolled.add_controller(drop);
         }
-        // Ctrl+V: paste an image (or files) from the clipboard as an attachment.
+        // Ctrl+V: the focused widget is the Entry's internal GtkText, whose own
+        // Ctrl+V keybinding would paste a file manager's path as text before a
+        // bubble-phase handler ever runs — so intercept in the CAPTURE phase,
+        // always consume the event, and resolve the content with an async
+        // cascade (clipboard formats are unreliable/racy on X11): files first
+        // (an image file attaches as the original file, not a re-encoded
+        // bitmap), then raw image data (screenshots), then plain text inserted
+        // manually since the default paste was suppressed.
         {
             let add_attach = add_attach.clone();
             let add_files = add_files.clone();
+            let entry_paste = entry.clone();
             let keys = gtk::EventControllerKey::new();
+            keys.set_propagation_phase(gtk::PropagationPhase::Capture);
             keys.connect_key_pressed(move |ctrl, key, _, mods| {
-                if mods.contains(gtk::gdk::ModifierType::CONTROL_MASK)
-                    && key == gtk::gdk::Key::v
+                if !mods.contains(gtk::gdk::ModifierType::CONTROL_MASK)
+                    || !matches!(key, gtk::gdk::Key::v | gtk::gdk::Key::V)
                 {
-                    let Some(w) = ctrl.widget() else {
-                        return glib::Propagation::Proceed;
-                    };
-                    let clip = w.clipboard();
-                    {
-                        let add_attach = add_attach.clone();
-                        clip.read_texture_async(gtk::gio::Cancellable::NONE, move |res| {
+                    return glib::Propagation::Proceed;
+                }
+                let Some(w) = ctrl.widget() else {
+                    return glib::Propagation::Proceed;
+                };
+                let clip = w.clipboard();
+                let add_files = add_files.clone();
+                let add_attach = add_attach.clone();
+                let entry = entry_paste.clone();
+                let clip2 = clip.clone();
+                clip.read_value_async(
+                    gtk::gdk::FileList::static_type(),
+                    glib::Priority::DEFAULT,
+                    gtk::gio::Cancellable::NONE,
+                    move |res| {
+                        if let Some(list) =
+                            res.ok().and_then(|v| v.get::<gtk::gdk::FileList>().ok())
+                        {
+                            add_files(list.files());
+                            return;
+                        }
+                        let clip3 = clip2.clone();
+                        clip2.read_texture_async(gtk::gio::Cancellable::NONE, move |res| {
                             if let Ok(Some(tex)) = res {
-                                let bytes = tex.save_to_png_bytes();
                                 add_attach(
-                                    bytes.to_vec(),
+                                    tex.save_to_png_bytes().to_vec(),
                                     "image/png".to_string(),
                                     "incollata.png".to_string(),
                                 );
+                                return;
                             }
-                        });
-                    }
-                    {
-                        let add_files = add_files.clone();
-                        clip.read_value_async(
-                            gtk::gdk::FileList::static_type(),
-                            glib::Priority::DEFAULT,
-                            gtk::gio::Cancellable::NONE,
-                            move |res| {
-                                if let Ok(val) = res {
-                                    if let Ok(list) = val.get::<gtk::gdk::FileList>() {
-                                        add_files(list.files());
-                                    }
+                            let entry = entry.clone();
+                            clip3.read_text_async(gtk::gio::Cancellable::NONE, move |res| {
+                                if let Ok(Some(text)) = res {
+                                    entry.delete_selection();
+                                    let mut pos = entry.position();
+                                    entry.insert_text(&text, &mut pos);
+                                    entry.set_position(pos);
                                 }
-                            },
-                        );
-                    }
-                }
-                glib::Propagation::Proceed
+                            });
+                        });
+                    },
+                );
+                glib::Propagation::Stop
             });
             entry.add_controller(keys);
         }
@@ -811,7 +905,8 @@ impl ThreadView {
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
         root.append(&overlay);
         root.append(&reply_banner);
-        root.append(&attach_strip);
+        root.append(&edit_banner);
+        root.append(&attach_scroll);
         root.append(&composer);
 
         Self {
@@ -845,6 +940,12 @@ impl ThreadView {
             reply,
             reply_banner,
             reply_banner_label,
+            bubbles: Rc::new(RefCell::new(HashMap::new())),
+            edit,
+            edit_banner,
+            on_edit,
+            on_forward: Rc::new(RefCell::new(None)),
+            on_delete: Rc::new(RefCell::new(None)),
             last_day: Rc::new(RefCell::new(None)),
         }
     }
@@ -856,7 +957,14 @@ impl ThreadView {
         let banner = self.reply_banner.clone();
         let label = self.reply_banner_label.clone();
         let entry = self.entry.clone();
+        let edit = self.edit.clone();
+        let edit_banner = self.edit_banner.clone();
         Rc::new(move |id, sender_jid, name, body| {
+            // Replying cancels an in-progress edit (mutually exclusive states).
+            if edit.borrow_mut().take().is_some() {
+                edit_banner.set_visible(false);
+                entry.set_text("");
+            }
             let preview: String = body.chars().take(80).collect();
             label.set_markup(&format!(
                 "<b>↩ {}</b>\n{}",
@@ -866,6 +974,26 @@ impl ThreadView {
             *reply.borrow_mut() = Some((id, sender_jid, name, body));
             banner.set_visible(true);
             entry.grab_focus();
+        })
+    }
+
+    /// A clonable callback that begins editing one of our messages: fills the
+    /// composer with the current text and shows the edit banner. Cancels any
+    /// in-progress reply.
+    fn edit_starter(&self) -> Rc<dyn Fn(String, String)> {
+        let edit = self.edit.clone();
+        let edit_banner = self.edit_banner.clone();
+        let reply = self.reply.clone();
+        let reply_banner = self.reply_banner.clone();
+        let entry = self.entry.clone();
+        Rc::new(move |id, body| {
+            *reply.borrow_mut() = None;
+            reply_banner.set_visible(false);
+            *edit.borrow_mut() = Some(id);
+            edit_banner.set_visible(true);
+            entry.set_text(&body);
+            entry.grab_focus();
+            entry.set_position(-1);
         })
     }
 
@@ -917,6 +1045,46 @@ impl ThreadView {
     /// play button is pressed.
     pub fn connect_play<F: Fn(String, String) + 'static>(&self, f: F) {
         *self.on_play.borrow_mut() = Some(Box::new(f));
+    }
+
+    /// Registers the callback invoked with `(msg_id, new_text)` when an edit is
+    /// confirmed from the composer.
+    pub fn connect_edit<F: Fn(String, String) + 'static>(&self, f: F) {
+        *self.on_edit.borrow_mut() = Some(Box::new(f));
+    }
+
+    /// Registers the callback invoked with a message id when "Inoltra" is chosen.
+    pub fn connect_forward<F: Fn(String) + 'static>(&self, f: F) {
+        *self.on_forward.borrow_mut() = Some(Box::new(f));
+    }
+
+    /// Registers the callback invoked with `(msg_id, can_revoke)` when "Elimina"
+    /// is chosen from the context menu.
+    pub fn connect_delete<F: Fn(String, bool) + 'static>(&self, f: F) {
+        *self.on_delete.borrow_mut() = Some(Box::new(f));
+    }
+
+    /// Rebuilds a message's bubble in place (after an edit or a revoke).
+    pub fn replace_bubble(&self, id: &str, m: &MessageRow) {
+        let old = self.bubbles.borrow().get(id).cloned();
+        let Some(old) = old else { return };
+        self.ticks.borrow_mut().remove(id);
+        self.media_pics.borrow_mut().remove(id);
+        self.audio_widgets.borrow_mut().remove(id);
+        // bubble() re-registers the fresh widget under the same id.
+        let new = self.bubble(m);
+        self.list.insert_child_after(&new, Some(&old));
+        self.list.remove(&old);
+    }
+
+    /// Removes a message's bubble (after a local "delete for me").
+    pub fn remove_bubble(&self, id: &str) {
+        if let Some(w) = self.bubbles.borrow_mut().remove(id) {
+            self.list.remove(&w);
+        }
+        self.ticks.borrow_mut().remove(id);
+        self.media_pics.borrow_mut().remove(id);
+        self.audio_widgets.borrow_mut().remove(id);
     }
 
     /// Plays a downloaded voice note (`id` → `path`), stopping any current one and
@@ -1153,6 +1321,9 @@ impl ThreadView {
         self.ticks.borrow_mut().clear();
         self.audio_widgets.borrow_mut().clear();
         self.media_pics.borrow_mut().clear();
+        self.bubbles.borrow_mut().clear();
+        *self.edit.borrow_mut() = None;
+        self.edit_banner.set_visible(false);
         // Drop any staged attachments when switching chats.
         self.pending.borrow_mut().clear();
         (self.rebuild_attach)();
@@ -1190,7 +1361,7 @@ impl ThreadView {
         // A photo/video with no caption is the image itself (no background); with a
         // caption it keeps the chat bubble so the caption sits in it. Other kinds
         // always get the normal chrome.
-        let media_img = m.media_kind == 1 || m.media_kind == 2;
+        let media_img = matches!(m.media_kind, 1 | 2 | 6);
         let caption = m
             .body
             .split_once(": ")
@@ -1240,7 +1411,7 @@ impl ThreadView {
             bubble.append(&quote);
         }
 
-        if m.media_kind == 1 || m.media_kind == 2 {
+        if matches!(m.media_kind, 1 | 2 | 6) {
             // Photo/video: the image IS the bubble (iMessage style — no chrome,
             // rounded corners, sized to the image's aspect ratio). Photos auto-load
             // their full image inline (history-sync strips the thumbnail); a click
@@ -1277,15 +1448,25 @@ impl ThreadView {
                 play.set_valign(gtk::Align::Center);
                 play.set_can_target(false);
                 frame.add_overlay(&play);
+            } else if kind == 6 {
+                let chip = gtk::Label::new(Some("GIF"));
+                chip.add_css_class("media-time");
+                chip.set_halign(gtk::Align::Center);
+                chip.set_valign(gtk::Align::Center);
+                chip.set_can_target(false);
+                frame.add_overlay(&chip);
             }
             // A caption-less image carries the time (+ tick) overlaid on the image;
             // a captioned one uses the normal time row under the caption instead.
             if bubbleless {
-                let stamp = if m.from_me {
+                let mut stamp = if m.from_me {
                     format!("{} {}", format_time(m.ts), status_glyph(m.status))
                 } else {
                     format_time(m.ts)
                 };
+                if m.edited {
+                    stamp = format!("modificata · {stamp}");
+                }
                 let time_chip = gtk::Label::new(Some(stamp.trim()));
                 time_chip.add_css_class("media-time");
                 time_chip.set_halign(gtk::Align::End);
@@ -1453,7 +1634,23 @@ impl ThreadView {
                 row.add_controller(click);
             }
             bubble.append(&row);
+        } else if m.revoked {
+            // Tombstone for a message deleted for everyone.
+            let lbl = gtk::Label::builder()
+                .xalign(0.0)
+                .wrap(true)
+                .wrap_mode(gtk::pango::WrapMode::WordChar)
+                .max_width_chars(42)
+                .build();
+            lbl.set_markup(&format!("<i>🚫 {}</i>", preview::REVOKED_PLACEHOLDER));
+            lbl.add_css_class("dim-label");
+            bubble.append(&lbl);
         } else {
+            // Link preview card (thumbnail + title/description), when the message
+            // carries one; clicking it opens the URL.
+            if !m.link_url.is_empty() && (!m.link_title.is_empty() || !m.link_desc.is_empty()) {
+                bubble.append(&link_card(m));
+            }
             // Render URLs as clickable links (markup). Build with the already-escaped
             // markup as the label so GTK never tries to parse the raw text (a bare
             // `&` in a URL would otherwise log a markup error).
@@ -1469,20 +1666,8 @@ impl ThreadView {
                 .max_width_chars(42)
                 .selectable(true)
                 .build();
-            // Open links in the default browser, but SILENCE the child's
-            // stdout/stderr so the browser's own logs don't leak into our terminal.
-            // gio::Subprocess reaps the child itself (no zombies); `xdg-open` routes
-            // to the user's default handler.
             text.connect_activate_link(|_label, uri| {
-                use std::ffi::OsStr;
-                let res = gtk::gio::Subprocess::newv(
-                    &[OsStr::new("xdg-open"), OsStr::new(uri)],
-                    gtk::gio::SubprocessFlags::STDOUT_SILENCE
-                        | gtk::gio::SubprocessFlags::STDERR_SILENCE,
-                );
-                if let Err(e) = res {
-                    log::warn!("open link failed: {e}");
-                }
+                crate::util::open_uri(uri);
                 glib::Propagation::Stop
             });
             bubble.append(&text);
@@ -1491,7 +1676,11 @@ impl ThreadView {
         // Photo/video already carry the time (+ tick) overlaid on the image.
         if !media_img {
             let time = gtk::Label::builder()
-                .label(format_time(m.ts))
+                .label(if m.edited {
+                    format!("modificata · {}", format_time(m.ts))
+                } else {
+                    format_time(m.ts)
+                })
                 .xalign(1.0)
                 .build();
             time.add_css_class("caption");
@@ -1519,7 +1708,9 @@ impl ThreadView {
             }
         }
 
-        // Reply triggers: double-click on the bubble, or right-click → "Rispondi".
+        // Context actions: double-click replies; right-click (or long-press on
+        // touch) opens the message menu. Buttons are built at open time so the
+        // 15-minute edit window is checked against the current clock.
         {
             let start = self.reply_starter();
             let disp = if m.from_me {
@@ -1535,43 +1726,136 @@ impl ThreadView {
                 let body = m.body.clone();
                 Rc::new(move || start(id.clone(), sender.clone(), disp.clone(), body.clone()))
             };
-            let dbl = gtk::GestureClick::new();
-            {
-                let trigger = trigger.clone();
-                dbl.connect_pressed(move |_, n, _, _| {
-                    if n >= 2 {
-                        trigger();
-                    }
-                });
+            if !m.revoked {
+                let dbl = gtk::GestureClick::new();
+                {
+                    let trigger = trigger.clone();
+                    dbl.connect_pressed(move |_, n, _, _| {
+                        if n >= 2 {
+                            trigger();
+                        }
+                    });
+                }
+                bubble.add_controller(dbl);
             }
-            bubble.add_controller(dbl);
-            let menu = gtk::GestureClick::new();
-            menu.set_button(3);
-            menu.set_propagation_phase(gtk::PropagationPhase::Capture);
-            {
-                let trigger = trigger.clone();
+
+            let open_menu: Rc<dyn Fn(f64, f64)> = {
                 let bubble_w = bubble.clone();
-                menu.connect_pressed(move |g, _, x, y| {
-                    g.set_state(gtk::EventSequenceState::Claimed);
+                let trigger = trigger.clone();
+                let edit_start = self.edit_starter();
+                let on_forward = self.on_forward.clone();
+                let on_delete = self.on_delete.clone();
+                let id = m.id.clone();
+                let body = m.body.clone();
+                let from_me = m.from_me;
+                let ts = m.ts;
+                let revoked = m.revoked;
+                // WhatsApp only allows editing one's own text messages.
+                let editable = m.from_me && m.media_kind == 0 && !m.audio && !m.revoked;
+                let copy_text: Option<String> = if m.revoked {
+                    None
+                } else if m.media_kind == 0 && !m.audio && !m.body.is_empty() {
+                    Some(m.body.clone())
+                } else {
+                    caption.clone()
+                };
+                Rc::new(move |x, y| {
                     let pop = gtk::Popover::builder().has_arrow(false).build();
                     pop.set_parent(&bubble_w);
                     pop.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-                    let btn = gtk::Button::with_label("↩ Rispondi");
-                    btn.add_css_class("flat");
-                    {
+                    let col = gtk::Box::new(gtk::Orientation::Vertical, 0);
+                    let item = |label: &str| {
+                        let b = gtk::Button::with_label(label);
+                        b.add_css_class("flat");
+                        if let Some(l) = b.child().and_downcast::<gtk::Label>() {
+                            l.set_xalign(0.0);
+                        }
+                        col.append(&b);
+                        b
+                    };
+                    if !revoked {
+                        let b = item("↩ Rispondi");
                         let trigger = trigger.clone();
                         let pop = pop.clone();
-                        btn.connect_clicked(move |_| {
+                        b.connect_clicked(move |_| {
                             trigger();
                             pop.popdown();
                         });
                     }
-                    pop.set_child(Some(&btn));
+                    if let Some(text) = copy_text.clone() {
+                        let b = item("⧉ Copia testo");
+                        let pop = pop.clone();
+                        b.connect_clicked(move |btn| {
+                            btn.clipboard().set_text(&text);
+                            pop.popdown();
+                        });
+                    }
+                    if !revoked {
+                        let b = item("➦ Inoltra");
+                        let on_forward = on_forward.clone();
+                        let id = id.clone();
+                        let pop = pop.clone();
+                        b.connect_clicked(move |_| {
+                            if let Some(f) = on_forward.borrow().as_ref() {
+                                f(id.clone());
+                            }
+                            pop.popdown();
+                        });
+                    }
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    if editable && now - ts <= 15 * 60 {
+                        let b = item("✏️ Modifica");
+                        let edit_start = edit_start.clone();
+                        let id = id.clone();
+                        let body = body.clone();
+                        let pop = pop.clone();
+                        b.connect_clicked(move |_| {
+                            edit_start(id.clone(), body.clone());
+                            pop.popdown();
+                        });
+                    }
+                    {
+                        let b = item("🗑 Elimina");
+                        let on_delete = on_delete.clone();
+                        let id = id.clone();
+                        let pop = pop.clone();
+                        let can_revoke = from_me && !revoked;
+                        b.connect_clicked(move |_| {
+                            if let Some(f) = on_delete.borrow().as_ref() {
+                                f(id.clone(), can_revoke);
+                            }
+                            pop.popdown();
+                        });
+                    }
+                    pop.set_child(Some(&col));
                     pop.connect_closed(|p| p.unparent());
                     pop.popup();
+                })
+            };
+            let menu = gtk::GestureClick::new();
+            menu.set_button(3);
+            menu.set_propagation_phase(gtk::PropagationPhase::Capture);
+            {
+                let open_menu = open_menu.clone();
+                menu.connect_pressed(move |g, _, x, y| {
+                    g.set_state(gtk::EventSequenceState::Claimed);
+                    open_menu(x, y);
                 });
             }
             bubble.add_controller(menu);
+            let lp = gtk::GestureLongPress::new();
+            lp.set_touch_only(true);
+            {
+                let open_menu = open_menu.clone();
+                lp.connect_pressed(move |g, x, y| {
+                    g.set_state(gtk::EventSequenceState::Claimed);
+                    open_menu(x, y);
+                });
+            }
+            bubble.add_controller(lp);
         }
 
         // In groups, show the sender's avatar to the left of incoming bubbles.
@@ -1603,9 +1887,15 @@ impl ThreadView {
                 .build();
             wrap.append(&avatar);
             wrap.append(&bubble);
+            self.bubbles
+                .borrow_mut()
+                .insert(m.id.clone(), wrap.clone().upcast());
             return wrap;
         }
 
+        self.bubbles
+            .borrow_mut()
+            .insert(m.id.clone(), bubble.clone().upcast());
         bubble
     }
 
@@ -1620,41 +1910,138 @@ impl ThreadView {
     }
 }
 
-/// The check glyph for an outgoing message's delivery status: 1 sent (✓), 2
-/// delivered and 3 read (✓✓ — colour distinguishes read). 0/other → none.
-/// Builds one preview-strip item (a 64×64 thumbnail or document tile) for a
+/// A clickable link-preview card: thumbnail (if any) + title, description and
+/// host, opening the URL on click.
+fn link_card(m: &MessageRow) -> gtk::Box {
+    let card = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .build();
+    card.add_css_class("link-card");
+    if !m.link_thumb.is_empty() {
+        let bytes = glib::Bytes::from(&m.link_thumb);
+        if let Ok(tex) = gtk::gdk::Texture::from_bytes(&bytes) {
+            let pic = gtk::Picture::new();
+            pic.set_size_request(64, 64);
+            pic.set_content_fit(gtk::ContentFit::Cover);
+            pic.set_paintable(Some(&tex));
+            pic.add_css_class("media-thumb");
+            card.append(&pic);
+        }
+    }
+    let col = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    col.set_valign(gtk::Align::Center);
+    if !m.link_title.is_empty() {
+        let t = gtk::Label::builder()
+            .label(&m.link_title)
+            .xalign(0.0)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .lines(2)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .max_width_chars(34)
+            .build();
+        t.add_css_class("caption-heading");
+        col.append(&t);
+    }
+    if !m.link_desc.is_empty() {
+        let d = gtk::Label::builder()
+            .label(&m.link_desc)
+            .xalign(0.0)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .lines(2)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .max_width_chars(38)
+            .build();
+        d.add_css_class("caption");
+        d.add_css_class("dim-label");
+        col.append(&d);
+    }
+    let host = m
+        .link_url
+        .split("://")
+        .nth(1)
+        .unwrap_or(&m.link_url)
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .to_string();
+    if !host.is_empty() {
+        let h = gtk::Label::builder().label(&host).xalign(0.0).build();
+        h.add_css_class("caption");
+        h.add_css_class("dim-label");
+        col.append(&h);
+    }
+    card.append(&col);
+    card.set_cursor_from_name(Some("pointer"));
+    let url = m.link_url.clone();
+    let click = gtk::GestureClick::new();
+    click.connect_released(move |_, _, _, _| crate::util::open_uri(&url));
+    card.add_controller(click);
+    card
+}
+
+/// Builds one preview-strip item (a 96×96 thumbnail or document tile) for a
 /// staged attachment, as a `gtk::Overlay` the caller adds the ✕ button onto.
 fn build_attach_item(att: &PendingAttachment) -> gtk::Overlay {
     let inner: gtk::Widget = if att.is_image {
         let pic = gtk::Picture::new();
-        pic.set_size_request(64, 64);
+        pic.set_size_request(96, 96);
         pic.set_content_fit(gtk::ContentFit::Cover);
-        let bytes = gtk::glib::Bytes::from(&att.data);
-        if let Ok(tex) = gtk::gdk::Texture::from_bytes(&bytes) {
+        if let Some(tex) = scaled_texture_from_bytes(&att.data, 192) {
             pic.set_paintable(Some(&tex));
         }
         pic.upcast()
     } else {
         let icon = gtk::Image::from_icon_name(doc_icon(&att.mime));
-        icon.set_pixel_size(28);
+        icon.set_pixel_size(32);
         let label = gtk::Label::builder()
             .label(&att.name)
             .ellipsize(gtk::pango::EllipsizeMode::Middle)
-            .max_width_chars(8)
+            .max_width_chars(11)
             .build();
         label.add_css_class("caption");
+        let size = gtk::Label::new(Some(&fmt_bytes(att.data.len() as i64)));
+        size.add_css_class("caption");
+        size.add_css_class("dim-label");
         let b = gtk::Box::new(gtk::Orientation::Vertical, 2);
-        b.set_size_request(64, 64);
+        b.set_size_request(96, 96);
         b.set_halign(gtk::Align::Center);
         b.set_valign(gtk::Align::Center);
         b.append(&icon);
         b.append(&label);
+        b.append(&size);
         b.upcast()
     };
     let overlay = gtk::Overlay::new();
     overlay.set_child(Some(&inner));
     overlay.add_css_class("attach-item");
     overlay
+}
+
+/// Like [`scaled_texture`] but decoding from in-memory bytes: the pixbuf loader
+/// is told the target size up front so a large staged photo never materializes
+/// at full resolution.
+fn scaled_texture_from_bytes(data: &[u8], max: i32) -> Option<gtk::gdk::Texture> {
+    use gtk::gdk_pixbuf::prelude::*;
+    let loader = gtk::gdk_pixbuf::PixbufLoader::new();
+    loader.connect_size_prepared(move |l, w, h| {
+        let scale = f64::from(max) / f64::from(w.max(h).max(1));
+        if scale < 1.0 {
+            l.set_size(
+                (f64::from(w) * scale).round() as i32,
+                (f64::from(h) * scale).round() as i32,
+            );
+        }
+    });
+    if loader.write(data).is_err() {
+        let _ = loader.close();
+        return None;
+    }
+    loader.close().ok()?;
+    let pb = loader.pixbuf()?;
+    Some(gtk::gdk::Texture::for_pixbuf(&pb))
 }
 
 /// Best-effort MIME type for a file name (+ optional bytes).

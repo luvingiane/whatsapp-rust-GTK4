@@ -1,7 +1,8 @@
-//! The contact / group profile panel, shown when the conversation header is
-//! clicked: a large picture, name + status, a Media placeholder, a block button
-//! (1:1), and the list of groups in common (1:1) or participants (group). Each
-//! row is clickable to open that participant's / group's profile.
+//! The contact / group profile panel, shown in the right side pane when the
+//! conversation header is clicked: a large picture, name + status, a Media row
+//! (opens the gallery page), a block button (1:1), and the list of groups in
+//! common (1:1) or participants (group). Each row is clickable to open that
+//! participant's / group's profile.
 
 use std::rc::Rc;
 
@@ -25,19 +26,18 @@ pub struct ProfileData {
     pub media_count: usize,
 }
 
-/// Builds and presents the profile window over `parent`, returning the window so
-/// the caller can keep a single instance (closing any previous one).
+/// Builds the profile panel content (a scrollable widget for the side pane).
 ///
 /// `on_open(jid)` fires when a participant / common-group row is clicked;
-/// `on_block(jid, want_blocked)` fires when the block button is toggled.
-pub fn present(
-    parent: &adw::ApplicationWindow,
+/// `on_block(jid, want_blocked)` fires when the block button is toggled;
+/// `on_media(jid)` when the Media row is activated.
+pub fn build(
     avatars: &AvatarCache,
     data: ProfileData,
     on_open: Rc<dyn Fn(String)>,
     on_block: Rc<dyn Fn(String, bool)>,
     on_media: Rc<dyn Fn(String)>,
-) -> adw::Window {
+) -> gtk::Widget {
     let avatar = adw::Avatar::new(128, Some(&data.title), true);
     avatar.set_halign(gtk::Align::Center);
     if let Some(path) = data.pic_path.as_deref() {
@@ -197,43 +197,10 @@ pub fn present(
         content.append(&btn);
     }
 
-    let scrolled = gtk::ScrolledWindow::builder()
+    gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .vexpand(true)
         .child(&content)
-        .build();
-
-    let tb = adw::ToolbarView::new();
-    tb.add_top_bar(&adw::HeaderBar::new());
-    tb.set_content(Some(&scrolled));
-
-    let window = adw::Window::builder()
-        // Non-modal so the media gallery / viewer opened from here stay interactive
-        // alongside the profile (Esc still closes it).
-        .modal(false)
-        .transient_for(parent)
-        .default_width(360)
-        .default_height(560)
-        .title(&data.title)
-        .content(&tb)
-        .build();
-
-    // Esc closes the profile (a second Esc, handled by the main window, then
-    // closes the chat).
-    let keys = gtk::EventControllerKey::new();
-    {
-        let window = window.clone();
-        keys.connect_key_pressed(move |_, key, _, _| {
-            if key == gtk::gdk::Key::Escape {
-                window.close();
-                gtk::glib::Propagation::Stop
-            } else {
-                gtk::glib::Propagation::Proceed
-            }
-        });
-    }
-    window.add_controller(keys);
-
-    window.present();
-    window
+        .build()
+        .upcast()
 }

@@ -31,11 +31,23 @@ pub struct ChatSummary {
 #[derive(Debug, Clone)]
 pub struct MediaItem {
     pub id: String,
-    /// 1 image, 2 video, 4 document.
+    /// 1 image, 2 video, 4 document, 6 gif.
     pub kind: i32,
     pub mime: String,
     pub name: String,
     pub size: i64,
+    pub thumb: Vec<u8>,
+    /// Message unix timestamp (seconds).
+    pub ts: i64,
+}
+
+/// A link shared in a chat, for the media pane's Links tab. `title`/`desc`/
+/// `thumb` come from the stored link preview and may be empty (bare URL).
+#[derive(Debug, Clone)]
+pub struct LinkItem {
+    pub url: String,
+    pub title: String,
+    pub desc: String,
     pub thumb: Vec<u8>,
 }
 
@@ -71,8 +83,8 @@ pub struct MessageRow {
     pub reply_text: String,
     /// Resolved display name of the quoted message's author (empty if none).
     pub reply_sender_name: String,
-    /// Media kind: 0 none, 1 image, 2 video, 3 audio, 4 document, 5 sticker. When
-    /// non-zero the message proto is stored (downloadable on demand).
+    /// Media kind: 0 none, 1 image, 2 video, 3 audio, 4 document, 5 sticker,
+    /// 6 gif. When non-zero the message proto is stored (downloadable on demand).
     pub media_kind: i32,
     /// Media MIME type (e.g. `image/jpeg`), used to pick a file extension.
     pub media_mime: String,
@@ -83,4 +95,14 @@ pub struct MessageRow {
     /// Small JPEG thumbnail bytes for inline preview (image/video/document); empty
     /// if none.
     pub media_thumb: Vec<u8>,
+    /// Whether the body was edited after sending.
+    pub edited: bool,
+    /// Whether the message was deleted for everyone (tombstone).
+    pub revoked: bool,
+    /// Link preview: URL, page title/description, small JPEG thumbnail. All
+    /// empty when the message carries no preview.
+    pub link_url: String,
+    pub link_title: String,
+    pub link_desc: String,
+    pub link_thumb: Vec<u8>,
 }

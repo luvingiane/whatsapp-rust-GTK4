@@ -9,8 +9,9 @@ pub mod chat_list;
 pub mod chat_object;
 pub mod login;
 pub mod media_grid;
-pub mod media_viewer;
+pub mod viewer_overlay;
 pub mod profile;
+pub mod side_pane;
 pub mod thread;
 pub mod window;
 

@@ -4,6 +4,10 @@
 use wacore::proto_helpers::MessageExt;
 use whatsapp_rust::waproto::whatsapp as wa;
 
+/// Placeholder shown (in bubbles and chat-list previews) for a message that was
+/// deleted for everyone.
+pub const REVOKED_PLACEHOLDER: &str = "Questo messaggio è stato eliminato";
+
 /// A short, human one-line preview of a message for the chat list (and, later,
 /// notifications). Plain text is returned verbatim; media and other kinds get a
 /// labelled placeholder (with the caption appended when present).

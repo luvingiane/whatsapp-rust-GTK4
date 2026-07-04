@@ -16,6 +16,21 @@ use crate::util::preview;
 /// A `chat_meta` row: (jid, archived, pinned, muted_until, saved_name).
 type ChatMetaRow = (String, bool, bool, i64, String);
 
+/// What [`Store::get_message_for_forward`] returns: the original text and, for
+/// media, the stored proto (still downloadable after `prepare_for_forward`, the
+/// CDN keys survive) plus the display metadata for the echo row in the target chat.
+pub struct ForwardSource {
+    pub body: String,
+    pub media_kind: i32,
+    pub media: Option<Vec<u8>>,
+    pub media_mime: String,
+    pub media_name: String,
+    pub media_thumb: Vec<u8>,
+    pub media_size: i64,
+    pub audio_secs: u32,
+    pub audio_waveform: Vec<u8>,
+}
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS chats (
   jid          TEXT PRIMARY KEY,
@@ -78,12 +93,22 @@ CREATE TABLE IF NOT EXISTS messages (
   reply_text TEXT,
   reply_sender TEXT,
   -- Media metadata (the proto itself is in `media`): kind 0 none/1 image/2 video/
-  -- 3 audio/4 document/5 sticker, MIME, document name, and a small JPEG thumbnail.
+  -- 3 audio/4 document/5 sticker/6 gif, MIME, document name, small JPEG thumbnail.
   media_kind INTEGER NOT NULL DEFAULT 0,
   media_mime TEXT,
   media_name TEXT,
   media_thumb BLOB,
   media_size INTEGER NOT NULL DEFAULT 0,
+  -- Message lifecycle: body was edited / message was revoked (deleted for
+  -- everyone; payload columns are cleared but the tombstone row stays).
+  edited     INTEGER NOT NULL DEFAULT 0,
+  revoked    INTEGER NOT NULL DEFAULT 0,
+  -- Link preview carried by the message (from ExtendedTextMessage on receive, or
+  -- our own OG fetch on send). NULL when the message has no preview.
+  link_url   TEXT,
+  link_title TEXT,
+  link_desc  TEXT,
+  link_thumb BLOB,
   PRIMARY KEY (chat_jid, id)
 );
 CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages(chat_jid, ts);
@@ -106,6 +131,12 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE messages ADD COLUMN media_name TEXT",
     "ALTER TABLE messages ADD COLUMN media_thumb BLOB",
     "ALTER TABLE messages ADD COLUMN media_size INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE messages ADD COLUMN edited INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE messages ADD COLUMN revoked INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE messages ADD COLUMN link_url TEXT",
+    "ALTER TABLE messages ADD COLUMN link_title TEXT",
+    "ALTER TABLE messages ADD COLUMN link_desc TEXT",
+    "ALTER TABLE messages ADD COLUMN link_thumb BLOB",
 ];
 
 /// Run on every open. (1) Baseline ✓ for our own messages that lack a status.
@@ -590,7 +621,7 @@ impl Store {
         tokio::task::spawn_blocking(move || -> Result<usize> {
             let guard = conn.lock().map_err(|_| anyhow!("store mutex poisoned"))?;
             let n: i64 = guard.query_row(
-                "SELECT COUNT(*) FROM messages WHERE chat_jid=?1 AND media_kind IN (1,2,4)",
+                "SELECT COUNT(*) FROM messages WHERE chat_jid=?1 AND media_kind IN (1,2,4,6)",
                 params![jid],
                 |r| r.get(0),
             )?;
@@ -605,8 +636,8 @@ impl Store {
         tokio::task::spawn_blocking(move || -> Result<Vec<MediaItem>> {
             let guard = conn.lock().map_err(|_| anyhow!("store mutex poisoned"))?;
             let mut stmt = guard.prepare(
-                "SELECT id, media_kind, media_mime, media_name, media_size, media_thumb
-                 FROM messages WHERE chat_jid=?1 AND media_kind IN (1,2,4)
+                "SELECT id, media_kind, media_mime, media_name, media_size, media_thumb, ts
+                 FROM messages WHERE chat_jid=?1 AND media_kind IN (1,2,4,6)
                  ORDER BY ts DESC, id DESC",
             )?;
             let rows = stmt
@@ -618,6 +649,77 @@ impl Store {
                         name: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
                         size: r.get(4)?,
                         thumb: r.get::<_, Option<Vec<u8>>>(5)?.unwrap_or_default(),
+                        ts: r.get(6)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await?
+    }
+
+    /// All stored video rows' protos, for the one-time GIF re-classification
+    /// (rows saved before kind 6 existed). Decoding happens in the caller.
+    pub async fn video_protos(&self) -> Result<Vec<(String, String, Vec<u8>)>> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<(String, String, Vec<u8>)>> {
+            let guard = conn.lock().map_err(|_| anyhow!("store mutex poisoned"))?;
+            let mut stmt = guard.prepare(
+                "SELECT chat_jid, id, media FROM messages
+                 WHERE media_kind=2 AND media IS NOT NULL",
+            )?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await?
+    }
+
+    /// Re-tags a batch of messages with a new media kind (one transaction).
+    pub async fn set_media_kind_bulk(
+        &self,
+        rows: Vec<(String, String)>,
+        kind: i32,
+    ) -> Result<usize> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<usize> {
+            let mut guard = conn.lock().map_err(|_| anyhow!("store mutex poisoned"))?;
+            let tx = guard.transaction()?;
+            let mut n = 0;
+            {
+                let mut stmt = tx.prepare(
+                    "UPDATE messages SET media_kind=?3 WHERE chat_jid=?1 AND id=?2",
+                )?;
+                for (chat_jid, id) in rows {
+                    n += stmt.execute(params![chat_jid, id, kind])?;
+                }
+            }
+            tx.commit()?;
+            Ok(n)
+        })
+        .await?
+    }
+
+    /// Stored link previews of a chat (newest first), for the media pane's Links
+    /// tab. Only rows with a persisted preview; bare URLs in older messages are
+    /// merged in by the caller via [`Self::chat_link_bodies`].
+    pub async fn chat_links(&self, jid: String) -> Result<Vec<crate::model::LinkItem>> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<crate::model::LinkItem>> {
+            let guard = conn.lock().map_err(|_| anyhow!("store mutex poisoned"))?;
+            let mut stmt = guard.prepare(
+                "SELECT link_url, link_title, link_desc, link_thumb FROM messages
+                 WHERE chat_jid=?1 AND link_url IS NOT NULL AND link_url != ''
+                 ORDER BY ts DESC, id DESC",
+            )?;
+            let rows = stmt
+                .query_map(params![jid], |r| {
+                    Ok(crate::model::LinkItem {
+                        url: r.get(0)?,
+                        title: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                        desc: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                        thumb: r.get::<_, Option<Vec<u8>>>(3)?.unwrap_or_default(),
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -913,6 +1015,7 @@ impl Store {
 
     /// Stores media metadata (kind/MIME/name/thumbnail) for a downloadable media
     /// message. The proto itself is stored separately via [`Self::set_media`].
+    #[allow(clippy::too_many_arguments)]
     pub async fn set_media_meta(
         &self,
         chat_jid: String,
@@ -977,6 +1080,157 @@ impl Store {
         .await?
     }
 
+    /// Replaces a message's body after an edit (ours or a peer's). Clears any
+    /// link preview — the caller re-extracts it from the edited content if still
+    /// present. Returns whether the target row existed.
+    pub async fn apply_edit(&self, chat_jid: String, id: String, new_body: String) -> Result<bool> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<bool> {
+            let guard = conn.lock().map_err(|_| anyhow!("store mutex poisoned"))?;
+            let n = guard.execute(
+                "UPDATE messages SET body=?3, edited=1,
+                        link_url=NULL, link_title=NULL, link_desc=NULL, link_thumb=NULL
+                 WHERE chat_jid=?1 AND id=?2",
+                params![chat_jid, id, new_body],
+            )?;
+            Ok(n > 0)
+        })
+        .await?
+    }
+
+    /// Marks a message as revoked (deleted for everyone) and drops its payload,
+    /// matching WhatsApp semantics: the tombstone row stays, the content goes.
+    /// Returns whether the target row existed.
+    pub async fn apply_revoke(&self, chat_jid: String, id: String) -> Result<bool> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<bool> {
+            let guard = conn.lock().map_err(|_| anyhow!("store mutex poisoned"))?;
+            let n = guard.execute(
+                "UPDATE messages SET revoked=1, body='', media=NULL, media_kind=0,
+                        media_mime=NULL, media_name=NULL, media_thumb=NULL, media_size=0,
+                        audio_secs=NULL, audio_waveform=NULL,
+                        link_url=NULL, link_title=NULL, link_desc=NULL, link_thumb=NULL
+                 WHERE chat_jid=?1 AND id=?2",
+                params![chat_jid, id],
+            )?;
+            Ok(n > 0)
+        })
+        .await?
+    }
+
+    /// Deletes a message locally ("delete for me"): the row is gone for good.
+    pub async fn delete_message(&self, chat_jid: String, id: String) -> Result<()> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let guard = conn.lock().map_err(|_| anyhow!("store mutex poisoned"))?;
+            guard.execute(
+                "DELETE FROM messages WHERE chat_jid=?1 AND id=?2",
+                params![chat_jid, id],
+            )?;
+            Ok(())
+        })
+        .await?
+    }
+
+    /// Stores a message's link preview (URL, title, description, thumbnail).
+    pub async fn set_link_preview(
+        &self,
+        chat_jid: String,
+        id: String,
+        url: String,
+        title: String,
+        desc: String,
+        thumb: Vec<u8>,
+    ) -> Result<()> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let guard = conn.lock().map_err(|_| anyhow!("store mutex poisoned"))?;
+            guard.execute(
+                "UPDATE messages SET link_url=?3, link_title=?4, link_desc=?5, link_thumb=?6
+                 WHERE chat_jid=?1 AND id=?2",
+                params![chat_jid, id, url, title, desc, thumb],
+            )?;
+            Ok(())
+        })
+        .await?
+    }
+
+    /// Recomputes a chat's `last_*` preview columns from its newest message row.
+    /// Needed after edit/revoke/delete: those can change the latest message
+    /// without a newer timestamp, which the MAX(last_ts) upsert guard ignores.
+    pub async fn refresh_chat_preview(&self, chat_jid: String) -> Result<()> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let guard = conn.lock().map_err(|_| anyhow!("store mutex poisoned"))?;
+            guard.execute(
+                "UPDATE chats SET
+                   last_message = COALESCE((SELECT CASE WHEN m.revoked=1 THEN ?2 ELSE m.body END
+                     FROM messages m WHERE m.chat_jid=?1 ORDER BY m.ts DESC, m.id DESC LIMIT 1), ''),
+                   last_ts = COALESCE((SELECT m.ts
+                     FROM messages m WHERE m.chat_jid=?1 ORDER BY m.ts DESC, m.id DESC LIMIT 1), last_ts),
+                   last_from_me = COALESCE((SELECT m.from_me
+                     FROM messages m WHERE m.chat_jid=?1 ORDER BY m.ts DESC, m.id DESC LIMIT 1), 0),
+                   last_status = COALESCE((SELECT CASE WHEN m.from_me=1 THEN m.status ELSE 0 END
+                     FROM messages m WHERE m.chat_jid=?1 ORDER BY m.ts DESC, m.id DESC LIMIT 1), 0)
+                 WHERE jid=?1",
+                params![chat_jid, preview::REVOKED_PLACEHOLDER],
+            )?;
+            Ok(())
+        })
+        .await?
+    }
+
+    /// Loads a single message (same shape as [`Self::load_messages`]), e.g. to
+    /// rebuild its bubble after an edit/revoke.
+    pub async fn load_message(&self, chat_jid: String, id: String) -> Result<Option<MessageRow>> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<Option<MessageRow>> {
+            let guard = conn.lock().map_err(|_| anyhow!("store mutex poisoned"))?;
+            let mut stmt = guard.prepare(&messages_query("chat_jid=?1 AND id=?2", "1"))?;
+            let row = stmt
+                .query_row(params![chat_jid, id], |r| row_to_message(&chat_jid, r))
+                .optional()?;
+            Ok(row)
+        })
+        .await?
+    }
+
+    /// The pieces needed to forward a message: its text and, for media, the
+    /// stored proto + display metadata to copy onto the optimistic echo row.
+    pub async fn get_message_for_forward(
+        &self,
+        chat_jid: String,
+        id: String,
+    ) -> Result<Option<ForwardSource>> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<Option<ForwardSource>> {
+            let guard = conn.lock().map_err(|_| anyhow!("store mutex poisoned"))?;
+            let row = guard
+                .query_row(
+                    "SELECT body, media_kind, media, media_mime, media_name, media_thumb,
+                            media_size, audio_secs, audio_waveform
+                     FROM messages WHERE chat_jid=?1 AND id=?2 AND revoked=0",
+                    params![chat_jid, id],
+                    |r| {
+                        Ok(ForwardSource {
+                            body: r.get(0)?,
+                            media_kind: r.get::<_, i64>(1)? as i32,
+                            media: r.get(2)?,
+                            media_mime: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                            media_name: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                            media_thumb: r.get::<_, Option<Vec<u8>>>(5)?.unwrap_or_default(),
+                            media_size: r.get(6)?,
+                            audio_secs: r.get::<_, Option<i64>>(7)?.unwrap_or(0) as u32,
+                            audio_waveform: r.get::<_, Option<Vec<u8>>>(8)?.unwrap_or_default(),
+                        })
+                    },
+                )
+                .optional()?;
+            Ok(row)
+        })
+        .await?
+    }
+
     /// Resolves a display name for `jid` (saved address-book name → contact
     /// pushname), or empty if unknown.
     pub async fn display_name(&self, jid: String) -> Result<String> {
@@ -1020,78 +1274,9 @@ impl Store {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || -> Result<Vec<MessageRow>> {
             let guard = conn.lock().map_err(|_| anyhow!("store mutex poisoned"))?;
-            // Resolve the sender's display name (saved name → pushname) for group
-            // author labels; empty → the UI falls back to the number. Order by
-            // (ts,id) — the same key the backfill cursor pages on (load_messages_before).
-            let mut stmt = guard.prepare(
-                "SELECT x.id, COALESCE(slm.pn, x.sender_jid) AS sender_jid,
-                        COALESCE(NULLIF(cm.saved_name,''), NULLIF(ct.name,''),
-                                 NULLIF(scm2.saved_name,''), NULLIF(sct2.name,''), '') AS sender_name,
-                        x.from_me, x.ts, x.body, x.status,
-                        (x.media_kind=3 OR (x.media_kind=0 AND x.media IS NOT NULL)) AS audio,
-                        x.audio_secs, x.audio_waveform, x.reply_text,
-                        COALESCE(rlm.pn, x.reply_sender) AS reply_sender_canon,
-                        COALESCE(NULLIF(rcm.saved_name,''), NULLIF(rct.name,''),
-                                 NULLIF(rcm2.saved_name,''), NULLIF(rct2.name,''), '') AS reply_sender_name,
-                        x.media_kind, x.media_mime, x.media_name, x.media_thumb, x.media_size
-                 FROM (
-                   SELECT id, sender_jid, from_me, ts, body, status, media, audio_secs, audio_waveform, reply_text, reply_sender,
-                          media_kind, media_mime, media_name, media_thumb, media_size
-                   FROM messages WHERE chat_jid=?1
-                   ORDER BY ts DESC, id DESC LIMIT ?2
-                 ) x
-                 LEFT JOIN chat_meta cm ON cm.jid = x.sender_jid
-                 LEFT JOIN contacts  ct ON ct.jid = x.sender_jid
-                 LEFT JOIN lid_map  slm ON slm.lid = x.sender_jid
-                 LEFT JOIN chat_meta scm2 ON scm2.jid = slm.pn
-                 LEFT JOIN contacts  sct2 ON sct2.jid = slm.pn
-                 LEFT JOIN lid_map  rlm ON rlm.lid = x.reply_sender
-                 LEFT JOIN chat_meta rcm ON rcm.jid = x.reply_sender
-                 LEFT JOIN contacts  rct ON rct.jid = x.reply_sender
-                 LEFT JOIN chat_meta rcm2 ON rcm2.jid = rlm.pn
-                 LEFT JOIN contacts  rct2 ON rct2.jid = rlm.pn
-                 ORDER BY x.ts ASC, x.id ASC",
-            )?;
+            let mut stmt = guard.prepare(&messages_query("chat_jid=?1", "?2"))?;
             let rows = stmt
-                .query_map(params![chat_jid, limit], |r| {
-                    Ok(MessageRow {
-                        id: r.get(0)?,
-                        chat_jid: chat_jid.clone(),
-                        sender_jid: r.get(1)?,
-                        sender_name: r.get(2)?,
-                        from_me: r.get::<_, i64>(3)? != 0,
-                        ts: r.get(4)?,
-                        body: r.get(5)?,
-                        status: r.get::<_, i64>(6)? as i32,
-                        audio: r.get::<_, i64>(7)? != 0,
-                        audio_secs: r.get::<_, Option<i64>>(8)?.unwrap_or(0) as u32,
-                        audio_waveform: r.get::<_, Option<Vec<u8>>>(9)?.unwrap_or_default(),
-                        reply_text: r.get::<_, Option<String>>(10)?.unwrap_or_default(),
-                        reply_sender_name: {
-                            let has_quote = r
-                                .get::<_, Option<String>>(10)?
-                                .map(|s| !s.is_empty())
-                                .unwrap_or(false);
-                            if !has_quote {
-                                String::new()
-                            } else {
-                                let resolved: String = r.get(12)?;
-                                if resolved.is_empty() {
-                                    r.get::<_, Option<String>>(11)?
-                                        .map(|j| preview::pretty_number(&j))
-                                        .unwrap_or_default()
-                                } else {
-                                    resolved
-                                }
-                            }
-                        },
-                        media_kind: r.get::<_, i64>(13)? as i32,
-                        media_mime: r.get::<_, Option<String>>(14)?.unwrap_or_default(),
-                        media_name: r.get::<_, Option<String>>(15)?.unwrap_or_default(),
-                        media_thumb: r.get::<_, Option<Vec<u8>>>(16)?.unwrap_or_default(),
-                        media_size: r.get::<_, i64>(17)?,
-                    })
-                })?
+                .query_map(params![chat_jid, limit], |r| row_to_message(&chat_jid, r))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })
@@ -1113,75 +1298,13 @@ impl Store {
             let guard = conn.lock().map_err(|_| anyhow!("store mutex poisoned"))?;
             // Keyset pagination on (ts,id): strictly older than the cursor, matching
             // the (ts DESC, id DESC) ordering used by load_messages.
-            let mut stmt = guard.prepare(
-                "SELECT x.id, COALESCE(slm.pn, x.sender_jid) AS sender_jid,
-                        COALESCE(NULLIF(cm.saved_name,''), NULLIF(ct.name,''),
-                                 NULLIF(scm2.saved_name,''), NULLIF(sct2.name,''), '') AS sender_name,
-                        x.from_me, x.ts, x.body, x.status,
-                        (x.media_kind=3 OR (x.media_kind=0 AND x.media IS NOT NULL)) AS audio,
-                        x.audio_secs, x.audio_waveform, x.reply_text,
-                        COALESCE(rlm.pn, x.reply_sender) AS reply_sender_canon,
-                        COALESCE(NULLIF(rcm.saved_name,''), NULLIF(rct.name,''),
-                                 NULLIF(rcm2.saved_name,''), NULLIF(rct2.name,''), '') AS reply_sender_name,
-                        x.media_kind, x.media_mime, x.media_name, x.media_thumb, x.media_size
-                 FROM (
-                   SELECT id, sender_jid, from_me, ts, body, status, media, audio_secs, audio_waveform, reply_text, reply_sender,
-                          media_kind, media_mime, media_name, media_thumb, media_size
-                   FROM messages
-                   WHERE chat_jid=?1 AND (ts < ?2 OR (ts = ?2 AND id < ?3))
-                   ORDER BY ts DESC, id DESC LIMIT ?4
-                 ) x
-                 LEFT JOIN chat_meta cm ON cm.jid = x.sender_jid
-                 LEFT JOIN contacts  ct ON ct.jid = x.sender_jid
-                 LEFT JOIN lid_map  slm ON slm.lid = x.sender_jid
-                 LEFT JOIN chat_meta scm2 ON scm2.jid = slm.pn
-                 LEFT JOIN contacts  sct2 ON sct2.jid = slm.pn
-                 LEFT JOIN lid_map  rlm ON rlm.lid = x.reply_sender
-                 LEFT JOIN chat_meta rcm ON rcm.jid = x.reply_sender
-                 LEFT JOIN contacts  rct ON rct.jid = x.reply_sender
-                 LEFT JOIN chat_meta rcm2 ON rcm2.jid = rlm.pn
-                 LEFT JOIN contacts  rct2 ON rct2.jid = rlm.pn
-                 ORDER BY x.ts ASC, x.id ASC",
-            )?;
+            let mut stmt = guard.prepare(&messages_query(
+                "chat_jid=?1 AND (ts < ?2 OR (ts = ?2 AND id < ?3))",
+                "?4",
+            ))?;
             let rows = stmt
                 .query_map(params![chat_jid, before_ts, before_id, limit], |r| {
-                    Ok(MessageRow {
-                        id: r.get(0)?,
-                        chat_jid: chat_jid.clone(),
-                        sender_jid: r.get(1)?,
-                        sender_name: r.get(2)?,
-                        from_me: r.get::<_, i64>(3)? != 0,
-                        ts: r.get(4)?,
-                        body: r.get(5)?,
-                        status: r.get::<_, i64>(6)? as i32,
-                        audio: r.get::<_, i64>(7)? != 0,
-                        audio_secs: r.get::<_, Option<i64>>(8)?.unwrap_or(0) as u32,
-                        audio_waveform: r.get::<_, Option<Vec<u8>>>(9)?.unwrap_or_default(),
-                        reply_text: r.get::<_, Option<String>>(10)?.unwrap_or_default(),
-                        reply_sender_name: {
-                            let has_quote = r
-                                .get::<_, Option<String>>(10)?
-                                .map(|s| !s.is_empty())
-                                .unwrap_or(false);
-                            if !has_quote {
-                                String::new()
-                            } else {
-                                let resolved: String = r.get(12)?;
-                                if resolved.is_empty() {
-                                    r.get::<_, Option<String>>(11)?
-                                        .map(|j| preview::pretty_number(&j))
-                                        .unwrap_or_default()
-                                } else {
-                                    resolved
-                                }
-                            }
-                        },
-                        media_kind: r.get::<_, i64>(13)? as i32,
-                        media_mime: r.get::<_, Option<String>>(14)?.unwrap_or_default(),
-                        media_name: r.get::<_, Option<String>>(15)?.unwrap_or_default(),
-                        media_thumb: r.get::<_, Option<Vec<u8>>>(16)?.unwrap_or_default(),
-                        media_size: r.get::<_, i64>(17)?,
-                    })
+                    row_to_message(&chat_jid, r)
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
@@ -1213,4 +1336,85 @@ impl Store {
         })
         .await?
     }
+}
+
+/// Builds the shared message-page SELECT. Resolves the sender's and reply-sender's
+/// display names (saved name → pushname) through the LID→PN map so group author
+/// labels work for both addressing forms; empty → the UI falls back to the number.
+/// Pages on (ts,id) — the same key the backfill cursor uses.
+fn messages_query(inner_where: &str, limit_param: &str) -> String {
+    format!(
+        "SELECT x.id, COALESCE(slm.pn, x.sender_jid) AS sender_jid,
+                COALESCE(NULLIF(cm.saved_name,''), NULLIF(ct.name,''),
+                         NULLIF(scm2.saved_name,''), NULLIF(sct2.name,''), '') AS sender_name,
+                x.from_me, x.ts, x.body, x.status,
+                (x.media_kind=3 OR (x.media_kind=0 AND x.media IS NOT NULL)) AS audio,
+                x.audio_secs, x.audio_waveform, x.reply_text,
+                COALESCE(rlm.pn, x.reply_sender) AS reply_sender_canon,
+                COALESCE(NULLIF(rcm.saved_name,''), NULLIF(rct.name,''),
+                         NULLIF(rcm2.saved_name,''), NULLIF(rct2.name,''), '') AS reply_sender_name,
+                x.media_kind, x.media_mime, x.media_name, x.media_thumb, x.media_size,
+                x.edited, x.revoked, x.link_url, x.link_title, x.link_desc, x.link_thumb
+         FROM (
+           SELECT id, sender_jid, from_me, ts, body, status, media, audio_secs, audio_waveform, reply_text, reply_sender,
+                  media_kind, media_mime, media_name, media_thumb, media_size,
+                  edited, revoked, link_url, link_title, link_desc, link_thumb
+           FROM messages WHERE {inner_where}
+           ORDER BY ts DESC, id DESC LIMIT {limit_param}
+         ) x
+         LEFT JOIN chat_meta cm ON cm.jid = x.sender_jid
+         LEFT JOIN contacts  ct ON ct.jid = x.sender_jid
+         LEFT JOIN lid_map  slm ON slm.lid = x.sender_jid
+         LEFT JOIN chat_meta scm2 ON scm2.jid = slm.pn
+         LEFT JOIN contacts  sct2 ON sct2.jid = slm.pn
+         LEFT JOIN lid_map  rlm ON rlm.lid = x.reply_sender
+         LEFT JOIN chat_meta rcm ON rcm.jid = x.reply_sender
+         LEFT JOIN contacts  rct ON rct.jid = x.reply_sender
+         LEFT JOIN chat_meta rcm2 ON rcm2.jid = rlm.pn
+         LEFT JOIN contacts  rct2 ON rct2.jid = rlm.pn
+         ORDER BY x.ts ASC, x.id ASC"
+    )
+}
+
+/// Maps one row of [`messages_query`] to a `MessageRow`.
+fn row_to_message(chat_jid: &str, r: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRow> {
+    let reply_text = r.get::<_, Option<String>>(10)?.unwrap_or_default();
+    let reply_sender_name = if reply_text.is_empty() {
+        String::new()
+    } else {
+        let resolved: String = r.get(12)?;
+        if resolved.is_empty() {
+            r.get::<_, Option<String>>(11)?
+                .map(|j| preview::pretty_number(&j))
+                .unwrap_or_default()
+        } else {
+            resolved
+        }
+    };
+    Ok(MessageRow {
+        id: r.get(0)?,
+        chat_jid: chat_jid.to_string(),
+        sender_jid: r.get(1)?,
+        sender_name: r.get(2)?,
+        from_me: r.get::<_, i64>(3)? != 0,
+        ts: r.get(4)?,
+        body: r.get(5)?,
+        status: r.get::<_, i64>(6)? as i32,
+        audio: r.get::<_, i64>(7)? != 0,
+        audio_secs: r.get::<_, Option<i64>>(8)?.unwrap_or(0) as u32,
+        audio_waveform: r.get::<_, Option<Vec<u8>>>(9)?.unwrap_or_default(),
+        reply_text,
+        reply_sender_name,
+        media_kind: r.get::<_, i64>(13)? as i32,
+        media_mime: r.get::<_, Option<String>>(14)?.unwrap_or_default(),
+        media_name: r.get::<_, Option<String>>(15)?.unwrap_or_default(),
+        media_thumb: r.get::<_, Option<Vec<u8>>>(16)?.unwrap_or_default(),
+        media_size: r.get::<_, i64>(17)?,
+        edited: r.get::<_, i64>(18)? != 0,
+        revoked: r.get::<_, i64>(19)? != 0,
+        link_url: r.get::<_, Option<String>>(20)?.unwrap_or_default(),
+        link_title: r.get::<_, Option<String>>(21)?.unwrap_or_default(),
+        link_desc: r.get::<_, Option<String>>(22)?.unwrap_or_default(),
+        link_thumb: r.get::<_, Option<Vec<u8>>>(23)?.unwrap_or_default(),
+    })
 }

@@ -2,7 +2,7 @@
 //! Tokio backend, and bridges backend events to the UI on the GTK main loop.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -56,31 +56,53 @@ fn on_activate(app: &adw::Application) {
 
     // Tracks which chat is currently open, so history/live messages target it.
     let current_open: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    // Latest active-chat snapshot, kept for the "Inoltra a…" picker.
+    let chats_now: Rc<RefCell<Vec<crate::model::ChatSummary>>> = Rc::new(RefCell::new(Vec::new()));
+    // Recently opened chats' history pages, so re-opening renders instantly.
+    let hist_cache: Rc<RefCell<HistCache>> = Rc::new(RefCell::new(HistCache::new()));
     // Number of pinned chats (WhatsApp caps at 3); refreshed on each snapshot.
     let pinned_count: Rc<Cell<usize>> = Rc::new(Cell::new(0));
     let command_tx = chans.command_tx.clone();
 
-    // Selecting a chat: switch the content pane and ask the backend for history.
-    // The active and archived lists share the same open behaviour.
-    {
+    // Selecting a chat: switch the content pane and render from the history
+    // cache when possible (the backend still syncs read-state/presence either
+    // way). The active and archived lists share the same open behaviour.
+    let open_chat_cb: Rc<dyn Fn(String, String)> = {
         let win_sel = win.clone();
         let command_tx = command_tx.clone();
         let current_open = current_open.clone();
-        win.chat_list.connect_open(move |jid, name| {
+        let hist_cache = hist_cache.clone();
+        Rc::new(move |jid: String, name: String| {
             *current_open.borrow_mut() = Some(jid.clone());
             win_sel.open_chat(&jid, &name);
-            let _ = command_tx.try_send(WaCommand::OpenChat(jid));
-        });
+            let hit = {
+                let cache = hist_cache.borrow();
+                if let Some(msgs) = cache.get(&jid) {
+                    win_sel.show_history(msgs);
+                    true
+                } else {
+                    false
+                }
+            };
+            if hit {
+                log::info!("history cache hit for {jid}");
+                hist_cache.borrow_mut().touch(&jid);
+            }
+            let _ = command_tx.try_send(WaCommand::OpenChat {
+                jid,
+                with_history: !hit,
+            });
+        })
+    };
+    {
+        let open_chat_cb = open_chat_cb.clone();
+        win.chat_list
+            .connect_open(move |jid, name| open_chat_cb(jid, name));
     }
     {
-        let win_sel = win.clone();
-        let command_tx = command_tx.clone();
-        let current_open = current_open.clone();
-        win.archived_list.connect_open(move |jid, name| {
-            *current_open.borrow_mut() = Some(jid.clone());
-            win_sel.open_chat(&jid, &name);
-            let _ = command_tx.try_send(WaCommand::OpenChat(jid));
-        });
+        let open_chat_cb = open_chat_cb.clone();
+        win.archived_list
+            .connect_open(move |jid, name| open_chat_cb(jid, name));
     }
 
     // The "Archiviate" entry opens the archived sub-page in the sidebar.
@@ -145,7 +167,9 @@ fn on_activate(app: &adw::Application) {
             let command_tx = command_tx.clone();
             let requested = requested.clone();
             move |jid: String| {
-                if requested.borrow_mut().insert(jid.clone()) {
+                if crate::util::jid::is_real_user_jid(&jid)
+                    && requested.borrow_mut().insert(jid.clone())
+                {
                     let _ = command_tx.try_send(WaCommand::FetchAvatar(jid));
                 }
             }
@@ -224,6 +248,78 @@ fn on_activate(app: &adw::Application) {
             let _ = command_tx.try_send(WaCommand::PlayAudio { chat_jid, id });
         });
     }
+    // Edit confirmed from the composer → send the edit to the open chat.
+    {
+        let command_tx = command_tx.clone();
+        let current_open = current_open.clone();
+        win.thread.connect_edit(move |id, new_text| {
+            if let Some(jid) = current_open.borrow().clone() {
+                let _ = command_tx.try_send(WaCommand::EditMessage { jid, id, new_text });
+            }
+        });
+    }
+    // "Elimina" from the message menu → confirm, then delete locally or revoke.
+    {
+        let command_tx = command_tx.clone();
+        let current_open = current_open.clone();
+        let win_del = win.clone();
+        win.thread.connect_delete(move |id, can_revoke| {
+            let Some(jid) = current_open.borrow().clone() else {
+                return;
+            };
+            present_delete_dialog(&win_del.window, &command_tx, jid, id, can_revoke);
+        });
+    }
+    // Same actions from the full-window media viewer.
+    {
+        let command_tx = command_tx.clone();
+        let win_vw = win.clone();
+        win.viewer.connect_delete(move |chat_jid, id, can_revoke| {
+            present_delete_dialog(&win_vw.window, &command_tx, chat_jid, id, can_revoke);
+        });
+    }
+    {
+        let command_tx = command_tx.clone();
+        let win_vw = win.clone();
+        let chats_now = chats_now.clone();
+        win.viewer.connect_forward(move |chat_jid, id| {
+            let command_tx = command_tx.clone();
+            present_forward_picker(&win_vw, &chats_now.borrow(), move |to_jid| {
+                let _ = command_tx.try_send(WaCommand::ForwardMessage {
+                    to_jid,
+                    chat_jid: chat_jid.clone(),
+                    id: id.clone(),
+                });
+            });
+        });
+    }
+    // Left/right navigation in the viewer re-fetches the neighbor media.
+    {
+        let command_tx = command_tx.clone();
+        win.viewer.connect_navigate(move |chat_jid, id| {
+            let _ = command_tx.try_send(WaCommand::DownloadMedia { chat_jid, id });
+        });
+    }
+    // "Inoltra" from the message menu → chat picker → forward command.
+    {
+        let command_tx = command_tx.clone();
+        let current_open = current_open.clone();
+        let win_fwd = win.clone();
+        let chats_now = chats_now.clone();
+        win.thread.connect_forward(move |id| {
+            let Some(chat_jid) = current_open.borrow().clone() else {
+                return;
+            };
+            let command_tx = command_tx.clone();
+            present_forward_picker(&win_fwd, &chats_now.borrow(), move |to_jid| {
+                let _ = command_tx.try_send(WaCommand::ForwardMessage {
+                    to_jid,
+                    chat_jid: chat_jid.clone(),
+                    id: id.clone(),
+                });
+            });
+        });
+    }
     // Conversation header click → fetch profile/group info for the panel.
     {
         let command_tx = command_tx.clone();
@@ -296,18 +392,21 @@ fn on_activate(app: &adw::Application) {
     let win_ev = win.clone();
     let event_rx = chans.event_rx.clone();
     let current_open_ev = current_open.clone();
+    let chats_now_ev = chats_now.clone();
+    let hist_cache_ev = hist_cache.clone();
     let presence_ev = presence.clone();
     let command_tx_ev = command_tx.clone();
     let pinned_count_ev = pinned_count.clone();
-    // At most one profile window at a time; opening a new one closes the previous.
-    let profile_win: Rc<RefCell<Option<adw::Window>>> = Rc::new(RefCell::new(None));
-    // Likewise for the media viewer and the gallery window.
-    let media_win: Rc<RefCell<Option<adw::Window>>> = Rc::new(RefCell::new(None));
-    let media_grid_win: Rc<RefCell<Option<adw::Window>>> = Rc::new(RefCell::new(None));
     // Photo tiles in the open gallery awaiting an on-demand download (id → Picture),
     // filled when the matching InlineReady arrives.
     let media_grid_tiles: crate::ui::media_grid::TileMap =
         Rc::new(RefCell::new(HashMap::new()));
+    // The side pane's X button hides it.
+    {
+        let win_x = win.clone();
+        win.side_pane
+            .connect_close(move || win_x.set_side_pane_visible(false));
+    }
     glib::spawn_future_local(async move {
         while let Ok(ev) = event_rx.recv().await {
             match ev {
@@ -339,6 +438,7 @@ fn on_activate(app: &adw::Application) {
                 WaEvent::Disconnected => {}
                 WaEvent::LoggedOut => {
                     *current_open_ev.borrow_mut() = None;
+                    hist_cache_ev.borrow_mut().clear();
                     win_ev.chat_list.update(&[]);
                     win_ev.update_archived(&[]);
                     win_ev.reset_content();
@@ -355,21 +455,43 @@ fn on_activate(app: &adw::Application) {
                         win_ev.show_main();
                     }
                     pinned_count_ev.set(chats.iter().filter(|c| c.pinned).count());
+                    *chats_now_ev.borrow_mut() = chats.clone();
                     win_ev.chat_list.update(&chats);
                 }
                 // Archived list (and its count) refreshed alongside the active list.
                 WaEvent::ArchivedChatsSnapshot(chats) => {
                     win_ev.update_archived(&chats);
                 }
-                // History/live messages: apply only if their chat is still open.
+                // History/live messages: cache the page, apply if still open.
                 WaEvent::ChatHistory { jid, messages } => {
+                    hist_cache_ev
+                        .borrow_mut()
+                        .put(jid.clone(), messages.clone());
                     if current_open_ev.borrow().as_deref() == Some(jid.as_str()) {
                         win_ev.show_history(&messages);
                     }
                 }
                 WaEvent::NewMessage(row) => {
+                    hist_cache_ev.borrow_mut().push_row(&row);
                     if current_open_ev.borrow().as_deref() == Some(row.chat_jid.as_str()) {
                         win_ev.append_message(&row);
+                    }
+                }
+                // A message was edited/revoked (by us or a peer): rebuild its
+                // bubble in place if the chat is on screen.
+                WaEvent::MessageUpdated { row } => {
+                    hist_cache_ev.borrow_mut().replace(&row);
+                    if current_open_ev.borrow().as_deref() == Some(row.chat_jid.as_str()) {
+                        win_ev.thread.replace_bubble(&row.id.clone(), &row);
+                    }
+                }
+                WaEvent::MessageDeleted { chat_jid, id } => {
+                    hist_cache_ev.borrow_mut().remove(&chat_jid, &id);
+                    if win_ev.viewer.is_showing(&id) {
+                        win_ev.viewer.hide();
+                    }
+                    if current_open_ev.borrow().as_deref() == Some(chat_jid.as_str()) {
+                        win_ev.thread.remove_bubble(&id);
                     }
                 }
                 // An older page for the open chat: prepend, preserving scroll.
@@ -386,6 +508,9 @@ fn on_activate(app: &adw::Application) {
                     message_ids,
                     status,
                 } => {
+                    hist_cache_ev
+                        .borrow_mut()
+                        .set_status(&chat_jid, &message_ids, status);
                     if current_open_ev.borrow().as_deref() == Some(chat_jid.as_str()) {
                         for id in &message_ids {
                             win_ev.thread.set_status(id, status);
@@ -415,33 +540,43 @@ fn on_activate(app: &adw::Application) {
                         }
                     }
                 }
-                // A photo/video finished downloading: open it in the viewer
-                // (replacing any open one).
-                WaEvent::MediaReady { kind, path } => {
-                    // Documents open in the system's default app; photos/videos use
-                    // the in-app viewer.
+                // A media file finished downloading: photos/videos/GIFs open in
+                // the full-window viewer; documents in the system's default app
+                // (after an explicit confirmation — the file came from the network).
+                WaEvent::MediaReady { chat_jid, id, kind, path, ts, from_me, siblings } => {
                     if kind == 4 {
-                        use std::ffi::OsStr;
-                        let _ = gtk::gio::Subprocess::newv(
-                            &[OsStr::new("xdg-open"), OsStr::new(&path)],
-                            gtk::gio::SubprocessFlags::STDOUT_SILENCE
-                                | gtk::gio::SubprocessFlags::STDERR_SILENCE,
+                        let name = std::path::Path::new(&path)
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| path.clone());
+                        let dialog = adw::MessageDialog::new(
+                            Some(&win_ev.window),
+                            Some("Aprire il documento?"),
+                            Some(&name),
                         );
+                        dialog.add_response("annulla", "Annulla");
+                        dialog.add_response("apri", "Apri");
+                        dialog
+                            .set_response_appearance("apri", adw::ResponseAppearance::Suggested);
+                        dialog.set_default_response(Some("apri"));
+                        let parent_win = win_ev.window.clone();
+                        dialog.connect_response(None, move |_, resp| {
+                            if resp == "apri" {
+                                crate::util::open_file(&path, Some(parent_win.upcast_ref()));
+                            }
+                        });
+                        dialog.present();
                         continue;
                     }
-                    let old = media_win.borrow_mut().take();
-                    if let Some(old) = old {
-                        old.close();
-                    }
-                    let w = crate::ui::media_viewer::present(&win_ev.window, kind, &path);
-                    {
-                        let media_win = media_win.clone();
-                        w.connect_close_request(move |_| {
-                            *media_win.borrow_mut() = None;
-                            glib::Propagation::Proceed
-                        });
-                    }
-                    *media_win.borrow_mut() = Some(w);
+                    let chat_name = chats_now_ev
+                        .borrow()
+                        .iter()
+                        .find(|c| c.jid == chat_jid)
+                        .map(|c| c.name.clone())
+                        .unwrap_or_else(|| win_ev.chat_title());
+                    win_ev
+                        .viewer
+                        .show(&chat_name, chat_jid, id, kind, path, ts, from_me, siblings);
                 }
                 // Header subtitle: the open chat's online presence.
                 WaEvent::PresenceInfo {
@@ -454,7 +589,7 @@ fn on_activate(app: &adw::Application) {
                         win_ev.set_presence(is_group, &online_names, total);
                     }
                 }
-                // Profile/group info arrived: open the panel (replacing any open one).
+                // Profile/group info arrived: show it in the right side pane.
                 WaEvent::Profile {
                     is_group,
                     jid,
@@ -466,12 +601,6 @@ fn on_activate(app: &adw::Application) {
                     rows,
                     media_count,
                 } => {
-                    // Bind in its own statement so the borrow ends before close():
-                    // close() fires the close-request handler, which borrows too.
-                    let old = profile_win.borrow_mut().take();
-                    if let Some(old) = old {
-                        old.close();
-                    }
                     let data = crate::ui::profile::ProfileData {
                         is_group,
                         jid,
@@ -501,24 +630,17 @@ fn on_activate(app: &adw::Application) {
                             let _ = tx.try_send(WaCommand::FetchChatMedia(jid));
                         })
                     };
-                    let w = crate::ui::profile::present(
-                        &win_ev.window,
+                    let w = crate::ui::profile::build(
                         &win_ev.avatars,
                         data,
                         on_open,
                         on_block,
                         on_media,
                     );
-                    {
-                        let profile_win = profile_win.clone();
-                        w.connect_close_request(move |_| {
-                            *profile_win.borrow_mut() = None;
-                            glib::Propagation::Proceed
-                        });
-                    }
-                    *profile_win.borrow_mut() = Some(w);
+                    win_ev.side_pane.show_profile(&w, "Profilo");
+                    win_ev.set_side_pane_visible(true);
                 }
-                // The chat's media gallery: open it in a tabbed window.
+                // The chat's media gallery: show it on the pane's media page.
                 WaEvent::ChatMedia {
                     jid,
                     photos,
@@ -526,10 +648,6 @@ fn on_activate(app: &adw::Application) {
                     documents,
                     links,
                 } => {
-                    let old = media_grid_win.borrow_mut().take();
-                    if let Some(old) = old {
-                        old.close();
-                    }
                     // Fresh gallery: drop the previous tile registrations.
                     media_grid_tiles.borrow_mut().clear();
                     let on_open: Rc<dyn Fn(String, i32)> = {
@@ -554,16 +672,9 @@ fn on_activate(app: &adw::Application) {
                             });
                         })
                     };
-                    let on_link: Rc<dyn Fn(String)> = Rc::new(move |url: String| {
-                        use std::ffi::OsStr;
-                        let _ = gtk::gio::Subprocess::newv(
-                            &[OsStr::new("xdg-open"), OsStr::new(&url)],
-                            gtk::gio::SubprocessFlags::STDOUT_SILENCE
-                                | gtk::gio::SubprocessFlags::STDERR_SILENCE,
-                        );
-                    });
-                    let w = crate::ui::media_grid::present(
-                        &win_ev.window,
+                    let on_link: Rc<dyn Fn(String)> =
+                        Rc::new(move |url: String| crate::util::open_uri(&url));
+                    let w = crate::ui::media_grid::build(
                         photos,
                         videos,
                         documents,
@@ -573,14 +684,8 @@ fn on_activate(app: &adw::Application) {
                         on_need,
                         media_grid_tiles.clone(),
                     );
-                    {
-                        let media_grid_win = media_grid_win.clone();
-                        w.connect_close_request(move |_| {
-                            *media_grid_win.borrow_mut() = None;
-                            glib::Propagation::Proceed
-                        });
-                    }
-                    *media_grid_win.borrow_mut() = Some(w);
+                    win_ev.side_pane.show_media(&w);
+                    win_ev.set_side_pane_visible(true);
                 }
             }
         }
@@ -592,10 +697,36 @@ fn on_activate(app: &adw::Application) {
         let win_esc = win.clone();
         let current_open_esc = current_open.clone();
         let keys = gtk::EventControllerKey::new();
+        // Capture phase so the viewer's arrow navigation beats the inner
+        // ScrolledWindow (which would otherwise scroll a zoomed photo).
+        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
         keys.connect_key_pressed(move |_, key, _, _| {
+            // While the media viewer is open, arrows step through the chat's
+            // media and Esc closes it (before any chat/selection handling).
+            if win_esc.viewer.visible() {
+                match key {
+                    gtk::gdk::Key::Escape => {
+                        win_esc.viewer.hide();
+                        return glib::Propagation::Stop;
+                    }
+                    gtk::gdk::Key::Left => {
+                        win_esc.viewer.navigate(-1);
+                        return glib::Propagation::Stop;
+                    }
+                    gtk::gdk::Key::Right => {
+                        win_esc.viewer.navigate(1);
+                        return glib::Propagation::Stop;
+                    }
+                    _ => {}
+                }
+            }
             if key == gtk::gdk::Key::Escape {
                 if win_esc.chat_list.is_selecting() {
                     win_esc.chat_list.cancel_selection();
+                    return glib::Propagation::Stop;
+                }
+                if win_esc.side_pane_visible() {
+                    win_esc.set_side_pane_visible(false);
                     return glib::Propagation::Stop;
                 }
                 if current_open_esc.borrow().is_some() {
@@ -617,6 +748,89 @@ fn on_activate(app: &adw::Application) {
     });
 
     win.window.present();
+}
+
+/// How many chats keep their history page cached, and how many rows per chat
+/// (a fresh open loads 80; live appends grow it a bit before trimming).
+const HIST_CAP: usize = 5;
+const HIST_MAX_ROWS: usize = 300;
+
+/// LRU cache of recently opened chats' history pages — rows only, never
+/// widgets/textures (those would pin decoded images in RAM, undoing the
+/// scaled-texture work). Maintained from the event stream, so an entry always
+/// matches the DB state for the recent page. A chat re-keyed by the LID↔PN
+/// merge simply misses (and ages out of the LRU).
+struct HistCache {
+    map: HashMap<String, Vec<crate::model::MessageRow>>,
+    lru: VecDeque<String>,
+}
+
+impl HistCache {
+    fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+            lru: VecDeque::new(),
+        }
+    }
+
+    fn get(&self, jid: &str) -> Option<&Vec<crate::model::MessageRow>> {
+        self.map.get(jid)
+    }
+
+    fn touch(&mut self, jid: &str) {
+        self.lru.retain(|j| j != jid);
+        self.lru.push_back(jid.to_string());
+    }
+
+    fn put(&mut self, jid: String, rows: Vec<crate::model::MessageRow>) {
+        self.map.insert(jid.clone(), rows);
+        self.touch(&jid);
+        while self.lru.len() > HIST_CAP {
+            if let Some(old) = self.lru.pop_front() {
+                self.map.remove(&old);
+            }
+        }
+    }
+
+    fn push_row(&mut self, row: &crate::model::MessageRow) {
+        if let Some(v) = self.map.get_mut(&row.chat_jid) {
+            v.push(row.clone());
+            if v.len() > HIST_MAX_ROWS {
+                let cut = v.len() - HIST_MAX_ROWS;
+                v.drain(..cut);
+            }
+        }
+    }
+
+    /// Advances (never regresses) the status of the given messages.
+    fn set_status(&mut self, chat_jid: &str, ids: &[String], status: i32) {
+        if let Some(v) = self.map.get_mut(chat_jid) {
+            for m in v.iter_mut() {
+                if m.status < status && ids.contains(&m.id) {
+                    m.status = status;
+                }
+            }
+        }
+    }
+
+    fn replace(&mut self, row: &crate::model::MessageRow) {
+        if let Some(v) = self.map.get_mut(&row.chat_jid) {
+            if let Some(m) = v.iter_mut().find(|m| m.id == row.id) {
+                *m = row.clone();
+            }
+        }
+    }
+
+    fn remove(&mut self, chat_jid: &str, id: &str) {
+        if let Some(v) = self.map.get_mut(chat_jid) {
+            v.retain(|m| m.id != id);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+        self.lru.clear();
+    }
 }
 
 /// How long the window can go without pointer/keyboard input before we report
@@ -697,6 +911,155 @@ fn fail(win: &MainWindow, msg: &str) {
     win.window.present();
 }
 
+/// "Eliminare il messaggio?" dialog, shared by the message context menu and the
+/// media viewer: "per me" always, "per tutti" (revoke) only for own messages.
+fn present_delete_dialog(
+    parent: &adw::ApplicationWindow,
+    command_tx: &async_channel::Sender<WaCommand>,
+    jid: String,
+    id: String,
+    can_revoke: bool,
+) {
+    let dialog = adw::MessageDialog::new(Some(parent), Some("Eliminare il messaggio?"), None);
+    dialog.add_response("annulla", "Annulla");
+    dialog.add_response("me", "Elimina per me");
+    dialog.set_response_appearance("me", adw::ResponseAppearance::Destructive);
+    if can_revoke {
+        dialog.add_response("tutti", "Elimina per tutti");
+        dialog.set_response_appearance("tutti", adw::ResponseAppearance::Destructive);
+    }
+    dialog.set_default_response(Some("annulla"));
+    let command_tx = command_tx.clone();
+    dialog.connect_response(None, move |_, resp| match resp {
+        "me" => {
+            let _ = command_tx.try_send(WaCommand::DeleteLocal {
+                jid: jid.clone(),
+                id: id.clone(),
+            });
+        }
+        "tutti" => {
+            let _ = command_tx.try_send(WaCommand::RevokeMessage {
+                jid: jid.clone(),
+                id: id.clone(),
+            });
+        }
+        _ => {}
+    });
+    dialog.present();
+}
+
+/// Modal "Inoltra a…" chat picker: a searchable list of the active chats;
+/// activating a row invokes `on_pick(jid)` and closes the picker.
+fn present_forward_picker(
+    win: &MainWindow,
+    chats: &[crate::model::ChatSummary],
+    on_pick: impl Fn(String) + 'static,
+) {
+    let dialog = adw::Window::builder()
+        .transient_for(&win.window)
+        .modal(true)
+        .default_width(360)
+        .default_height(480)
+        .title("Inoltra a…")
+        .build();
+
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    root.append(&adw::HeaderBar::new());
+
+    let search = gtk::SearchEntry::builder()
+        .placeholder_text("Cerca chat")
+        .margin_top(6)
+        .margin_bottom(6)
+        .margin_start(6)
+        .margin_end(6)
+        .build();
+    root.append(&search);
+
+    let list = gtk::ListBox::new();
+    list.add_css_class("navigation-sidebar");
+    list.set_selection_mode(gtk::SelectionMode::None);
+
+    // Rows and the parallel jid/name vectors (row.index() is stable under
+    // filtering, so index → jid stays correct while searching).
+    let mut jids: Vec<String> = Vec::with_capacity(chats.len());
+    let mut names: Vec<String> = Vec::with_capacity(chats.len());
+    for c in chats {
+        let h = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(10)
+            .margin_top(4)
+            .margin_bottom(4)
+            .margin_start(6)
+            .margin_end(6)
+            .build();
+        let av = adw::Avatar::new(32, Some(&c.name), true);
+        if let Some(tex) = win.avatars.borrow().get(&c.jid) {
+            av.set_custom_image(Some(tex));
+        }
+        let lbl = gtk::Label::builder()
+            .label(&c.name)
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .build();
+        h.append(&av);
+        h.append(&lbl);
+        let row = gtk::ListBoxRow::new();
+        row.set_child(Some(&h));
+        list.append(&row);
+        jids.push(c.jid.clone());
+        names.push(c.name.to_lowercase());
+    }
+
+    {
+        let search = search.clone();
+        list.set_filter_func(move |row| {
+            let q = search.text().to_lowercase();
+            q.is_empty()
+                || names
+                    .get(row.index() as usize)
+                    .is_some_and(|n| n.contains(&q))
+        });
+    }
+    {
+        let list = list.clone();
+        search.connect_search_changed(move |_| list.invalidate_filter());
+    }
+    {
+        let dialog = dialog.clone();
+        list.connect_row_activated(move |_, row| {
+            if let Some(jid) = jids.get(row.index() as usize) {
+                on_pick(jid.clone());
+            }
+            dialog.close();
+        });
+    }
+
+    let scrolled = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .child(&list)
+        .build();
+    root.append(&scrolled);
+
+    // Esc closes the picker.
+    {
+        let dialog_esc = dialog.clone();
+        let keys = gtk::EventControllerKey::new();
+        keys.connect_key_pressed(move |_, key, _, _| {
+            if key == gtk::gdk::Key::Escape {
+                dialog_esc.close();
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        dialog.add_controller(keys);
+    }
+
+    dialog.set_content(Some(&root));
+    dialog.present();
+    search.grab_focus();
+}
+
 /// Loads the small amount of custom CSS we need (the unread badge).
 fn load_css() {
     let provider = gtk::CssProvider::new();
@@ -736,8 +1099,16 @@ fn load_css() {
             background-color: alpha(#000000, 0.45); border-radius: 999px; padding: 8px; } \
          .media-time { color: #ffffff; font-size: 0.75em; \
             background-color: alpha(#000000, 0.45); border-radius: 8px; padding: 1px 6px; } \
-         .attach-item { border-radius: 8px; background-color: alpha(currentColor, 0.08); } \
-         .attach-x { opacity: 0; min-height: 0; min-width: 0; padding: 1px; margin: 1px; \
+         .link-card { background-color: alpha(currentColor, 0.07); \
+            border-radius: 8px; padding: 6px; margin-bottom: 2px; } \
+         .viewer-dim { background-color: rgba(0, 0, 0, 0.88); } \
+         .viewer-text { color: #ffffff; } \
+         .viewer-osd { color: #ffffff; background-color: alpha(#000000, 0.45); \
+            background-image: none; border-radius: 999px; } \
+         .viewer-osd:hover { background-color: alpha(#ffffff, 0.25); } \
+         .attach-item { border-radius: 12px; background-color: alpha(currentColor, 0.08); } \
+         .attach-item picture { border-radius: 12px; } \
+         .attach-x { opacity: 0.65; min-height: 0; min-width: 0; padding: 1px; margin: 3px; \
             color: #ffffff; background-color: alpha(#000000, 0.6); border-radius: 999px; } \
          .attach-item:hover .attach-x { opacity: 1; } \
          .block-btn { \

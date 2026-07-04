@@ -11,7 +11,9 @@ use libadwaita as adw;
 
 use super::chat_list::ChatList;
 use super::login::LoginView;
+use super::side_pane::SidePane;
 use super::thread::ThreadView;
+use super::viewer_overlay::ViewerOverlay;
 use crate::model::MessageRow;
 
 type OpenProfileCb = Rc<RefCell<Option<Box<dyn Fn(String)>>>>;
@@ -42,6 +44,12 @@ pub struct MainWindow {
     on_open_profile: OpenProfileCb,
     /// Shared avatar texture cache (read by the profile panel for participants).
     pub avatars: super::AvatarCache,
+    /// Right side pane hosting the profile panel and the media gallery.
+    pub side_pane: SidePane,
+    /// The split view revealing/hiding the side pane next to the conversation.
+    split: adw::OverlaySplitView,
+    /// Full-window media viewer layered over everything.
+    pub viewer: ViewerOverlay,
 }
 
 impl MainWindow {
@@ -156,12 +164,24 @@ impl MainWindow {
         content_tb.add_top_bar(&content_header);
         content_tb.set_content(Some(&content_stack));
 
+        // Right side pane (profile + media), revealed next to the conversation
+        // and pushing it aside — no secondary windows.
+        let side_pane = SidePane::new();
+        let split = adw::OverlaySplitView::new();
+        split.set_content(Some(&content_tb));
+        split.set_sidebar(Some(&side_pane.root));
+        split.set_sidebar_position(gtk::PackType::End);
+        split.set_collapsed(false);
+        split.set_show_sidebar(false);
+        split.set_min_sidebar_width(300.0);
+        split.set_max_sidebar_width(380.0);
+
         // Resizable split: a Paned (instead of NavigationSplitView) so the user can
         // drag the divider to widen/narrow the chat list. The width is persisted and
         // restored across restarts. Trade-off: no adaptive collapse on narrow windows.
         let paned = gtk::Paned::new(gtk::Orientation::Horizontal);
         paned.set_start_child(Some(&sidebar_nav));
-        paned.set_end_child(Some(&content_tb));
+        paned.set_end_child(Some(&split));
         paned.set_resize_start_child(false);
         paned.set_shrink_start_child(false);
         paned.set_shrink_end_child(false);
@@ -193,6 +213,12 @@ impl MainWindow {
         stack.add_named(&paned, Some("main"));
         stack.set_visible_child_name("login");
 
+        // Full-window media viewer, layered over the whole UI.
+        let viewer = ViewerOverlay::new();
+        let root_overlay = gtk::Overlay::new();
+        root_overlay.set_child(Some(&stack));
+        root_overlay.add_overlay(&viewer.root);
+
         let window = adw::ApplicationWindow::builder()
             .application(app)
             .title("WhatsApp")
@@ -200,7 +226,7 @@ impl MainWindow {
             .default_height(650)
             .width_request(360)
             .height_request(420)
-            .content(&stack)
+            .content(&root_overlay)
             .build();
 
         Self {
@@ -220,7 +246,28 @@ impl MainWindow {
             profile_jid,
             on_open_profile,
             avatars,
+            side_pane,
+            split,
+            viewer,
         }
+    }
+
+    /// Reveals or hides the right side pane (profile/media). Hiding also drops
+    /// the pane's content so stale widgets don't linger.
+    pub fn set_side_pane_visible(&self, visible: bool) {
+        self.split.set_show_sidebar(visible);
+        if !visible {
+            self.side_pane.clear();
+        }
+    }
+
+    pub fn side_pane_visible(&self) -> bool {
+        self.split.shows_sidebar()
+    }
+
+    /// The open chat's display name as shown in the header.
+    pub fn chat_title(&self) -> String {
+        self.header_name.label().to_string()
     }
 
     /// Sets the status/description line under the conversation header name
@@ -295,6 +342,7 @@ impl MainWindow {
     /// Open a chat in the content pane: set the title and switch to the (empty,
     /// loading) thread view. History arrives later via [`Self::show_history`].
     pub fn open_chat(&self, jid: &str, name: &str) {
+        self.set_side_pane_visible(false);
         self.header_name.set_label(name);
         self.set_header_subtitle("");
         self.header_avatar.set_text(Some(name));
@@ -320,6 +368,7 @@ impl MainWindow {
 
     /// Reset the content pane to the empty placeholder (e.g. on logout).
     pub fn reset_content(&self) {
+        self.set_side_pane_visible(false);
         self.header_name.set_label("WhatsApp");
         self.set_header_subtitle("");
         self.thread.clear();

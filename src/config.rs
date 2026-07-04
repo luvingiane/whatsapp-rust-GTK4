@@ -70,6 +70,18 @@ pub fn write_sidebar_width(width: i32) {
     }
 }
 
+/// Whether a one-shot maintenance marker (e.g. a data backfill) has run.
+pub fn has_flag(name: &str) -> bool {
+    data_file(name).map(|p| p.exists()).unwrap_or(false)
+}
+
+/// Records a one-shot maintenance marker (best effort).
+pub fn set_flag(name: &str) {
+    if let Ok(path) = data_file(name) {
+        let _ = std::fs::write(path, b"1");
+    }
+}
+
 /// Resolves `<XDG data>/whatsapp-rust-gtk4/<file>`, creating the directory.
 fn data_file(file: &str) -> anyhow::Result<PathBuf> {
     let mut dir = glib::user_data_dir();

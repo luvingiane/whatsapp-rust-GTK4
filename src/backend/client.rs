@@ -39,6 +39,44 @@ use crate::util::preview;
 /// a burst, so we wait a moment after a change before querying + pushing.
 const SNAPSHOT_DEBOUNCE: Duration = Duration::from_millis(400);
 
+/// Epoch-seconds until which we suppress rate-limited `usync`/group-metadata calls
+/// after a `429 rate-overlimit` from Meta. Process-global (one connection); `0` =
+/// no cooldown. Hammering these endpoints risks the account, so on any 429 we back
+/// off hard and fall back to locally-known data until this passes.
+static USYNC_COOLDOWN_UNTIL: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+/// How long to pause rate-limited network resolution after a 429.
+const USYNC_COOLDOWN_SECS: i64 = 600;
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// True while backing off from a recent 429 — callers should skip network identity
+/// /metadata resolution and use local data instead.
+fn usync_in_cooldown() -> bool {
+    USYNC_COOLDOWN_UNTIL.load(std::sync::atomic::Ordering::Relaxed) > now_secs()
+}
+
+/// Starts (or extends) the post-429 cooldown.
+fn begin_usync_cooldown() {
+    USYNC_COOLDOWN_UNTIL.store(
+        now_secs() + USYNC_COOLDOWN_SECS,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    warn!("usync cooldown: pausing identity/metadata resolution for {USYNC_COOLDOWN_SECS}s (429 rate-overlimit)");
+}
+
+/// Whether an error is a Meta rate-limit (`429` / `rate-overlimit`).
+fn rate_limited<E: std::fmt::Display>(e: &E) -> bool {
+    let s = e.to_string();
+    s.contains("429") || s.contains("rate-overlimit")
+}
+
+use crate::util::jid::{base_jid, is_real_user_jid};
+
 /// Online-presence state for the currently-open chat. Shared between the command
 /// loop (which sets the open chat + subscribes) and the event handler (which
 /// updates the online set from `Event::Presence`). All JIDs are compared by their
@@ -99,6 +137,38 @@ pub async fn run(
         warn!("normalize_message_senders failed: {e:?}");
     }
     let dirty = Arc::new(Notify::new());
+    // One-time backfill: rows stored before media_kind 6 existed have GIFs
+    // recorded as plain videos. Their protos are in the DB, so re-classify once.
+    if !config::has_flag("gif_backfill_v1") {
+        let store = store.clone();
+        let dirty = dirty.clone();
+        tokio::spawn(async move {
+            let rows = store.video_protos().await.unwrap_or_default();
+            let gifs: Vec<(String, String)> = rows
+                .into_iter()
+                .filter(|(_, _, proto)| {
+                    codec::message_decode(proto)
+                        .ok()
+                        .and_then(|m| m.video_message)
+                        .is_some_and(|v| v.gif_playback.unwrap_or(false))
+                })
+                .map(|(chat, id, _)| (chat, id))
+                .collect();
+            if !gifs.is_empty() {
+                match store.set_media_kind_bulk(gifs, 6).await {
+                    Ok(n) => {
+                        info!("gif backfill: re-tagged {n} message(s)");
+                        dirty.notify_one();
+                    }
+                    Err(e) => {
+                        warn!("gif backfill failed: {e:?}");
+                        return; // retry next launch
+                    }
+                }
+            }
+            config::set_flag("gif_backfill_v1");
+        });
+    }
     // Presence tracking for the currently-open chat (online dots under the header).
     let presence: Arc<Mutex<PresenceState>> = Arc::new(Mutex::new(PresenceState::default()));
     // Per-message group receipt aggregation (✓✓/blue only when all recipients done).
@@ -189,7 +259,7 @@ pub async fn run(
             // `jid_forms` then uses to re-key the archive flag onto the PN chat row.
             // Passive learning (ContactUpdate/messages) never covers archived
             // contacts we don't open, so without this they leak into the main list.
-            let lids: Vec<whatsapp_rust::Jid> = match store.all_chat_meta().await {
+            let candidates: Vec<whatsapp_rust::Jid> = match store.all_chat_meta().await {
                 Ok(rows) => rows
                     .into_iter()
                     .filter(|(j, archived, ..)| *archived && j.ends_with("@lid"))
@@ -197,12 +267,38 @@ pub async fn run(
                     .collect(),
                 Err(_) => Vec::new(),
             };
+            // Pre-filter: drop @lid we can ALREADY resolve locally (no network), so we
+            // only usync genuinely-unknown ones. Over successive launches this shrinks
+            // toward zero as the library persists learned LID↔PN pairs.
+            let mut lids: Vec<whatsapp_rust::Jid> = Vec::new();
+            for j in candidates {
+                let known = jid_forms(&client, &j)
+                    .await
+                    .iter()
+                    .any(|f| f.ends_with("@s.whatsapp.net"));
+                if !known {
+                    lids.push(j);
+                }
+            }
             if !lids.is_empty() {
-                info!("usync: resolving {} archived @lid JIDs", lids.len());
-                for chunk in lids.chunks(50) {
+                info!("usync: {} archived @lid still unresolved", lids.len());
+                // Small batches, spaced out, capped per session, and aborting hard on a
+                // 429 so we never hammer Meta (ban risk).
+                const CHUNK: usize = 20;
+                const MAX_CHUNKS: usize = 6;
+                for chunk in lids.chunks(CHUNK).take(MAX_CHUNKS) {
+                    if usync_in_cooldown() {
+                        info!("usync: in cooldown, skipping archived LID resolution");
+                        break;
+                    }
                     if let Err(e) = client.contacts().get_user_info(chunk).await {
                         warn!("get_user_info (lid resolve) failed: {e:?}");
+                        if rate_limited(&e) {
+                            begin_usync_cooldown();
+                            break;
+                        }
                     }
+                    tokio::time::sleep(Duration::from_secs(4)).await;
                 }
             }
             // One-shot: fetch subjects for active groups that lost/never had a name,
@@ -288,7 +384,7 @@ pub async fn run(
                 break;
             }
             cmd = command_rx.recv() => match cmd {
-                Ok(WaCommand::OpenChat(jid)) => {
+                Ok(WaCommand::OpenChat { jid, with_history }) => {
                     // Opening a chat reads it: clear its unread badge and refresh
                     // the list. `jid` is already the canonical chat key. Capture the
                     // read-receipt target (latest unread incoming) BEFORE clearing, so
@@ -375,6 +471,11 @@ pub async fn run(
                                 return;
                             };
                             if is_group {
+                                // Don't add metadata queries to a rate-limited connection;
+                                // members fill in on a later open once the cooldown passes.
+                                if usync_in_cooldown() {
+                                    return;
+                                }
                                 if let Ok(meta) = cmd_client.groups().get_metadata(&parsed).await {
                                     let mut members = Vec::new();
                                     for p in &meta.participants {
@@ -456,11 +557,15 @@ pub async fn run(
                     // Load a small first page; older messages backfill on scroll-up
                     // (LoadOlder). A large initial page keeps many bubbles — and their
                     // inline image textures — resident at once, inflating RAM.
-                    match store.load_messages(jid.clone(), 80).await {
-                        Ok(messages) => {
-                            let _ = event_tx.send(WaEvent::ChatHistory { jid, messages }).await;
+                    // Skipped when the UI rendered from its own history cache — the
+                    // read-state/presence work above still runs on every open.
+                    if with_history {
+                        match store.load_messages(jid.clone(), 80).await {
+                            Ok(messages) => {
+                                let _ = event_tx.send(WaEvent::ChatHistory { jid, messages }).await;
+                            }
+                            Err(e) => warn!("load_messages failed: {e:?}"),
                         }
-                        Err(e) => warn!("load_messages failed: {e:?}"),
                     }
                 }
                 Ok(WaCommand::LoadOlder { jid, before_ts, before_id, count }) => {
@@ -498,41 +603,19 @@ pub async fn run(
                     if !text.is_empty() {
                         match jid.parse::<whatsapp_rust::Jid>() {
                             Ok(to) => {
-                                // A reply must carry the quote in a ContextInfo on an
-                                // extended-text message; a plain message uses send_text.
-                                let res = if let Some(q) = &quote {
-                                    let msg = wa::Message {
-                                        extended_text_message: Some(Box::new(
-                                            wa::message::ExtendedTextMessage {
-                                                text: Some(text.clone()),
-                                                context_info: Some(Box::new(wa::ContextInfo {
-                                                    stanza_id: Some(q.id.clone()),
-                                                    participant: (!q.sender.is_empty())
-                                                        .then(|| q.sender.clone()),
-                                                    quoted_message: Some(Box::new(wa::Message {
-                                                        conversation: Some(q.body.clone()),
-                                                        ..Default::default()
-                                                    })),
-                                                    ..Default::default()
-                                                })),
-                                                ..Default::default()
-                                            },
-                                        )),
-                                        ..Default::default()
-                                    };
-                                    cmd_client.send_message(to, msg).await
+                                // Texts with a URL fetch OG metadata first (recipients
+                                // only see a preview if it's embedded in the message);
+                                // spawned so a slow site never blocks the command loop.
+                                if crate::util::text::find_urls(&text).is_empty() {
+                                    send_text_message(&cmd_client, &store, &event_tx, &dirty, jid, to, text, quote).await;
                                 } else {
-                                    cmd_client.send_text(to, text.clone()).await
-                                };
-                                match res {
-                                    Ok(res) => {
-                                        let reply = quote.map(|q| (q.sender, q.body));
-                                        store_outgoing(&store, &event_tx, &dirty, jid, text, res.message_id, None, reply).await;
-                                    }
-                                    Err(e) => {
-                                        warn!("send_text failed: {e:?}");
-                                        let _ = event_tx.send(WaEvent::Error(format!("Invio fallito: {e}"))).await;
-                                    }
+                                    let cmd_client = cmd_client.clone();
+                                    let store = store.clone();
+                                    let event_tx = event_tx.clone();
+                                    let dirty = dirty.clone();
+                                    tokio::spawn(async move {
+                                        send_text_message(&cmd_client, &store, &event_tx, &dirty, jid, to, text, quote).await;
+                                    });
                                 }
                             }
                             Err(e) => warn!("send_text: bad jid {jid}: {e:?}"),
@@ -571,7 +654,7 @@ pub async fn run(
                                 let reply = quote.map(|q| (q.sender, q.body));
                                 match cmd_client.send_message(to, msg).await {
                                     Ok(res) => {
-                                        store_outgoing(&store, &event_tx, &dirty, jid, "🎤 Messaggio vocale".to_string(), res.message_id, Some(OutgoingMedia { proto: media, kind: 3, mime: "audio/ogg".to_string(), name: String::new(), thumb: Vec::new(), size: 0, audio_secs: duration, audio_waveform: waveform }), reply).await;
+                                        store_outgoing(&store, &event_tx, &dirty, jid, "🎤 Messaggio vocale".to_string(), res.message_id, Some(OutgoingMedia { proto: media, kind: 3, mime: "audio/ogg".to_string(), name: String::new(), thumb: Vec::new(), size: 0, audio_secs: duration, audio_waveform: waveform }), reply, None).await;
                                     }
                                     Err(e) => {
                                         warn!("send audio failed: {e:?}");
@@ -614,7 +697,7 @@ pub async fn run(
                                                 let _ = std::fs::write(&path, &data);
                                             }
                                             let body = caption.clone().filter(|c| !c.is_empty()).map(|c| format!("📷 Foto: {c}")).unwrap_or_else(|| "📷 Foto".to_string());
-                                            store_outgoing(&store, &event_tx, &dirty, jid, body, res.message_id, Some(OutgoingMedia { proto, kind: 1, mime, name: String::new(), thumb: Vec::new(), size, audio_secs: 0, audio_waveform: Vec::new() }), reply).await;
+                                            store_outgoing(&store, &event_tx, &dirty, jid, body, res.message_id, Some(OutgoingMedia { proto, kind: 1, mime, name: String::new(), thumb: Vec::new(), size, audio_secs: 0, audio_waveform: Vec::new() }), reply, None).await;
                                         }
                                         Err(e) => {
                                             warn!("send image failed: {e:?}");
@@ -658,7 +741,7 @@ pub async fn run(
                                             if let Ok(path) = config::media_cache_path(&res.message_id, &ext) {
                                                 let _ = std::fs::write(&path, &data);
                                             }
-                                            store_outgoing(&store, &event_tx, &dirty, jid, format!("📄 {file_name}"), res.message_id, Some(OutgoingMedia { proto, kind: 4, mime, name: file_name, thumb: Vec::new(), size, audio_secs: 0, audio_waveform: Vec::new() }), reply).await;
+                                            store_outgoing(&store, &event_tx, &dirty, jid, format!("📄 {file_name}"), res.message_id, Some(OutgoingMedia { proto, kind: 4, mime, name: file_name, thumb: Vec::new(), size, audio_secs: 0, audio_waveform: Vec::new() }), reply, None).await;
                                         }
                                         Err(e) => {
                                             warn!("send document failed: {e:?}");
@@ -673,6 +756,110 @@ pub async fn run(
                             }
                         }
                         Err(e) => warn!("send_document: bad jid {jid}: {e:?}"),
+                    }
+                }
+                Ok(WaCommand::EditMessage { jid, id, new_text }) => {
+                    let new_text = new_text.trim().to_string();
+                    if !new_text.is_empty() {
+                        match jid.parse::<whatsapp_rust::Jid>() {
+                            Ok(to) => {
+                                let content = wa::Message {
+                                    conversation: Some(new_text.clone()),
+                                    ..Default::default()
+                                };
+                                match cmd_client.edit_message(to, id.clone(), content).await {
+                                    Ok(_) => match store.apply_edit(jid.clone(), id.clone(), new_text).await {
+                                        Ok(true) => push_updated_row(&store, &event_tx, &dirty, jid, id).await,
+                                        Ok(false) => warn!("edit: message {id} not in store"),
+                                        Err(e) => warn!("apply_edit failed: {e:?}"),
+                                    },
+                                    Err(e) => {
+                                        warn!("edit_message failed: {e:?}");
+                                        let _ = event_tx.send(WaEvent::Error(format!("Modifica fallita: {e}"))).await;
+                                    }
+                                }
+                            }
+                            Err(e) => warn!("edit: bad jid {jid}: {e:?}"),
+                        }
+                    }
+                }
+                Ok(WaCommand::RevokeMessage { jid, id }) => {
+                    match jid.parse::<whatsapp_rust::Jid>() {
+                        Ok(to) => {
+                            match cmd_client
+                                .revoke_message(to, id.clone(), whatsapp_rust::RevokeType::Sender)
+                                .await
+                            {
+                                Ok(()) => match store.apply_revoke(jid.clone(), id.clone()).await {
+                                    Ok(true) => push_updated_row(&store, &event_tx, &dirty, jid, id).await,
+                                    Ok(false) => warn!("revoke: message {id} not in store"),
+                                    Err(e) => warn!("apply_revoke failed: {e:?}"),
+                                },
+                                Err(e) => {
+                                    warn!("revoke_message failed: {e:?}");
+                                    let _ = event_tx.send(WaEvent::Error(format!("Eliminazione fallita: {e}"))).await;
+                                }
+                            }
+                        }
+                        Err(e) => warn!("revoke: bad jid {jid}: {e:?}"),
+                    }
+                }
+                Ok(WaCommand::DeleteLocal { jid, id }) => {
+                    match store.delete_message(jid.clone(), id.clone()).await {
+                        Ok(()) => {
+                            if let Err(e) = store.refresh_chat_preview(jid.clone()).await {
+                                warn!("refresh_chat_preview failed: {e:?}");
+                            }
+                            let _ = event_tx.send(WaEvent::MessageDeleted { chat_jid: jid, id }).await;
+                            dirty.notify_one();
+                        }
+                        Err(e) => warn!("delete_message failed: {e:?}"),
+                    }
+                }
+                Ok(WaCommand::ForwardMessage { to_jid, chat_jid, id }) => {
+                    match store.get_message_for_forward(chat_jid, id).await {
+                        Ok(Some(src)) => match to_jid.parse::<whatsapp_rust::Jid>() {
+                            Ok(to) => {
+                                // Media re-uses the stored proto (the CDN keys survive
+                                // prepare_for_forward, so no re-upload); text is rebuilt.
+                                let msg = src
+                                    .media
+                                    .as_deref()
+                                    .and_then(|b| match codec::message_decode(b) {
+                                        Ok(m) => Some(m),
+                                        Err(e) => {
+                                            warn!("forward: stored proto decode failed: {e:?}");
+                                            None
+                                        }
+                                    })
+                                    .unwrap_or_else(|| wa::Message {
+                                        conversation: Some(src.body.clone()),
+                                        ..Default::default()
+                                    });
+                                match cmd_client.forward_message(to, &msg).await {
+                                    Ok(res) => {
+                                        let media = (src.media_kind != 0).then(|| OutgoingMedia {
+                                            proto: src.media.clone().unwrap_or_default(),
+                                            kind: src.media_kind,
+                                            mime: src.media_mime.clone(),
+                                            name: src.media_name.clone(),
+                                            thumb: src.media_thumb.clone(),
+                                            size: src.media_size,
+                                            audio_secs: src.audio_secs,
+                                            audio_waveform: src.audio_waveform.clone(),
+                                        });
+                                        store_outgoing(&store, &event_tx, &dirty, to_jid, src.body, res.message_id, media, None, None).await;
+                                    }
+                                    Err(e) => {
+                                        warn!("forward_message failed: {e:?}");
+                                        let _ = event_tx.send(WaEvent::Error(format!("Inoltro fallito: {e}"))).await;
+                                    }
+                                }
+                            }
+                            Err(e) => warn!("forward: bad jid {to_jid}: {e:?}"),
+                        },
+                        Ok(None) => warn!("forward: message not found"),
+                        Err(e) => warn!("get_message_for_forward failed: {e:?}"),
                     }
                 }
                 Ok(WaCommand::PlayAudio { chat_jid, id }) => {
@@ -743,13 +930,14 @@ pub async fn run(
                     let kind_ext = if let Some(m) = msg.image_message.as_ref() {
                         Some((1, ext_from_mime(m.mimetype.as_deref(), "jpg")))
                     } else if let Some(m) = msg.video_message.as_ref() {
-                        Some((2, ext_from_mime(m.mimetype.as_deref(), "mp4")))
+                        let kind = if m.gif_playback.unwrap_or(false) { 6 } else { 2 };
+                        Some((kind, ext_from_mime(m.mimetype.as_deref(), "mp4")))
                     } else if let Some(m) = msg.document_message.as_ref() {
                         Some((4, doc_ext(m)))
-                    } else if let Some(m) = msg.sticker_message.as_ref() {
-                        Some((5, ext_from_mime(m.mimetype.as_deref(), "webp")))
                     } else {
-                        None
+                        msg.sticker_message
+                            .as_ref()
+                            .map(|m| (5, ext_from_mime(m.mimetype.as_deref(), "webp")))
                     };
                     let Some((kind, ext)) = kind_ext else {
                         warn!("DownloadMedia: unsupported media for {id}");
@@ -762,9 +950,36 @@ pub async fn run(
                             continue;
                         }
                     };
+                    // Message timestamp + ownership for the viewer's header/actions.
+                    let row = store.load_message(chat_jid.clone(), id.clone()).await.ok().flatten();
+                    let ts = row.as_ref().map_or(0, |r| r.ts);
+                    let from_me = row.as_ref().is_some_and(|r| r.from_me);
+                    // The chat's visual media (oldest-first) for viewer navigation.
+                    let siblings: Vec<(String, i32)> = if matches!(kind, 1 | 2 | 6) {
+                        let mut v: Vec<(String, i32)> = store
+                            .chat_media(chat_jid.clone())
+                            .await
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(|it| matches!(it.kind, 1 | 2 | 6))
+                            .map(|it| (it.id, it.kind))
+                            .collect();
+                        v.reverse(); // chat_media is newest-first
+                        v
+                    } else {
+                        Vec::new()
+                    };
                     if path.exists() {
                         let _ = event_tx
-                            .send(WaEvent::MediaReady { kind, path: path.to_string_lossy().into_owned() })
+                            .send(WaEvent::MediaReady {
+                                chat_jid,
+                                id,
+                                kind,
+                                path: path.to_string_lossy().into_owned(),
+                                ts,
+                                from_me,
+                                siblings,
+                            })
                             .await;
                         continue;
                     }
@@ -785,7 +1000,15 @@ pub async fn run(
                                 warn!("write media failed: {e:?}");
                             } else {
                                 let _ = event_tx
-                                    .send(WaEvent::MediaReady { kind, path: path.to_string_lossy().into_owned() })
+                                    .send(WaEvent::MediaReady {
+                                        chat_jid,
+                                        id,
+                                        kind,
+                                        path: path.to_string_lossy().into_owned(),
+                                        ts,
+                                        from_me,
+                                        siblings,
+                                    })
                                     .await;
                             }
                         }
@@ -872,6 +1095,9 @@ pub async fn run(
                                     // Network failed (e.g. 429): fall back to the members
                                     // OpenChat loaded into presence, deduped by base.
                                     warn!("group metadata failed: {e:?}");
+                                    if rate_limited(&e) {
+                                        begin_usync_cooldown();
+                                    }
                                     let cached: Vec<(String, String)> = {
                                         let st = presence.lock().unwrap();
                                         if st.open_jid == jid { st.members.clone() } else { Vec::new() }
@@ -901,10 +1127,20 @@ pub async fn run(
                             let number = preview::pretty_number(&jid);
                             let name = store.display_name(jid.clone()).await.unwrap_or_default();
                             let title = if name.is_empty() { number.clone() } else { name };
-                            // About/status text + block state for the 1:1 panel.
-                            let status = match cmd_client.contacts().get_user_info(std::slice::from_ref(&parsed)).await {
-                                Ok(info) => info.values().next().and_then(|u| u.status.clone()).unwrap_or_default(),
-                                Err(e) => { warn!("get_user_info (status) failed: {e:?}"); String::new() }
+                            // About/status text + block state for the 1:1 panel. Skip the
+                            // network fetch while rate-limited (cooldown) to protect the
+                            // account; the panel just shows no status text in that case.
+                            let status = if usync_in_cooldown() {
+                                String::new()
+                            } else {
+                                match cmd_client.contacts().get_user_info(std::slice::from_ref(&parsed)).await {
+                                    Ok(info) => info.values().next().and_then(|u| u.status.clone()).unwrap_or_default(),
+                                    Err(e) => {
+                                        warn!("get_user_info (status) failed: {e:?}");
+                                        if rate_limited(&e) { begin_usync_cooldown(); }
+                                        String::new()
+                                    }
+                                }
                             };
                             let blocked = cmd_client.blocking().is_blocked(&parsed).await.unwrap_or(false);
                             let mut rows = Vec::new();
@@ -941,26 +1177,45 @@ pub async fn run(
                         let ext = if it.kind == 4 {
                             doc_ext_from(&it.name, &it.mime)
                         } else {
-                            ext_from_mime(Some(&it.mime), if it.kind == 2 { "mp4" } else { "jpg" })
+                            ext_from_mime(
+                                Some(&it.mime),
+                                if matches!(it.kind, 2 | 6) { "mp4" } else { "jpg" },
+                            )
                         };
                         let cached = config::media_cache_path(&it.id, &ext)
                             .ok()
                             .filter(|p| p.exists())
                             .map(|p| p.to_string_lossy().into_owned());
-                        let entry = MediaEntry { id: it.id, name: it.name, size: it.size, thumb: it.thumb, cached };
+                        let entry = MediaEntry {
+                            id: it.id,
+                            kind: it.kind,
+                            mime: it.mime,
+                            name: it.name,
+                            size: it.size,
+                            thumb: it.thumb,
+                            ts: it.ts,
+                            cached,
+                        };
                         match it.kind {
                             1 => photos.push(entry),
-                            2 => videos.push(entry),
+                            2 | 6 => videos.push(entry),
                             _ => documents.push(entry),
                         }
                     }
-                    // Extract unique links from message bodies.
-                    let mut links = Vec::new();
-                    let mut seen = HashSet::new();
+                    // Links: stored previews first, then bare URLs extracted from
+                    // bodies (messages that predate the preview columns), deduped.
+                    let mut links = store.chat_links(jid.clone()).await.unwrap_or_default();
+                    let mut seen: HashSet<String> =
+                        links.iter().map(|l| l.url.clone()).collect();
                     for body in store.chat_link_bodies(jid.clone()).await.unwrap_or_default() {
                         for url in crate::util::text::find_urls(&body) {
                             if seen.insert(url.clone()) {
-                                links.push(url);
+                                links.push(crate::model::LinkItem {
+                                    url,
+                                    title: String::new(),
+                                    desc: String::new(),
+                                    thumb: Vec::new(),
+                                });
                             }
                         }
                     }
@@ -1045,6 +1300,11 @@ fn spawn_fetch_avatar(
     tx: &Sender<WaEvent>,
     inflight: &Arc<Mutex<HashSet<String>>>,
 ) {
+    // Skip placeholder/invalid JIDs (e.g. a stray `0@s.whatsapp.net`) — no point
+    // hitting the network for a picture that can't exist.
+    if !is_real_user_jid(&jid) {
+        return;
+    }
     let client = client.clone();
     let tx = tx.clone();
     let inflight = inflight.clone();
@@ -1213,9 +1473,64 @@ struct OutgoingMedia {
     audio_waveform: Vec<u8>,
 }
 
+/// Sends a text message: replies and/or link previews go on an extended-text
+/// message (quote in ContextInfo, OG metadata fetched here); a bare text uses
+/// `send_text`. Stores the optimistic echo on success.
+#[allow(clippy::too_many_arguments)]
+async fn send_text_message(
+    client: &Arc<Client>,
+    store: &Store,
+    tx: &Sender<WaEvent>,
+    dirty: &Notify,
+    jid: String,
+    to: whatsapp_rust::Jid,
+    text: String,
+    quote: Option<crate::backend::ReplyQuote>,
+) {
+    let url = crate::util::text::find_urls(&text).into_iter().next();
+    let link = match url {
+        Some(u) => tokio::task::spawn_blocking(move || {
+            crate::util::og::fetch_og(&u)
+                .map(|og| (u, og.title, og.description, og.thumb_jpeg))
+        })
+        .await
+        .ok()
+        .flatten(),
+        None => None,
+    };
+    let res = if quote.is_some() || link.is_some() {
+        let msg = wa::Message {
+            extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+                text: Some(text.clone()),
+                matched_text: link.as_ref().map(|l| l.0.clone()),
+                title: link.as_ref().map(|l| l.1.clone()).filter(|s| !s.is_empty()),
+                description: link.as_ref().map(|l| l.2.clone()).filter(|s| !s.is_empty()),
+                jpeg_thumbnail: link.as_ref().map(|l| l.3.clone()).filter(|b| !b.is_empty()),
+                context_info: quote.as_ref().map(|q| Box::new(reply_context(q))),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        client.send_message(to, msg).await
+    } else {
+        client.send_text(to, text.clone()).await
+    };
+    match res {
+        Ok(res) => {
+            let reply = quote.map(|q| (q.sender, q.body));
+            store_outgoing(store, tx, dirty, jid, text, res.message_id, None, reply, link).await;
+        }
+        Err(e) => {
+            warn!("send_text failed: {e:?}");
+            let _ = tx.send(WaEvent::Error(format!("Invio fallito: {e}"))).await;
+        }
+    }
+}
+
 /// Inserts a message we just sent into the store (optimistic, status = Sent) and
 /// notifies the UI so the bubble appears immediately. The later self-fanout echo
 /// is suppressed by `insert_message` returning `false` for the duplicate id.
+#[allow(clippy::too_many_arguments)]
 async fn store_outgoing(
     store: &Store,
     tx: &Sender<WaEvent>,
@@ -1225,6 +1540,7 @@ async fn store_outgoing(
     id: String,
     media: Option<OutgoingMedia>,
     reply: Option<(String, String)>, // (quoted author jid, quoted preview)
+    link: Option<(String, String, String, Vec<u8>)>, // (url, title, desc, thumb)
 ) {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1254,9 +1570,23 @@ async fn store_outgoing(
         media_name: media.as_ref().map(|m| m.name.clone()).unwrap_or_default(),
         media_thumb: media.as_ref().map(|m| m.thumb.clone()).unwrap_or_default(),
         media_size: media.as_ref().map(|m| m.size).unwrap_or(0),
+        edited: false,
+        revoked: false,
+        link_url: link.as_ref().map(|l| l.0.clone()).unwrap_or_default(),
+        link_title: link.as_ref().map(|l| l.1.clone()).unwrap_or_default(),
+        link_desc: link.as_ref().map(|l| l.2.clone()).unwrap_or_default(),
+        link_thumb: link.as_ref().map(|l| l.3.clone()).unwrap_or_default(),
     };
     if let Err(e) = store.insert_message(row.clone()).await {
         warn!("store_outgoing insert failed: {e:?}");
+    }
+    if let Some((url, title, desc, thumb)) = link {
+        if let Err(e) = store
+            .set_link_preview(chat.clone(), id.clone(), url, title, desc, thumb)
+            .await
+        {
+            warn!("store_outgoing set_link_preview failed: {e:?}");
+        }
     }
     if let Some(m) = media {
         if let Err(e) = store.set_media(chat.clone(), id.clone(), m.proto).await {
@@ -1289,6 +1619,29 @@ async fn store_outgoing(
         warn!("store_outgoing apply failed: {e:?}");
     }
     let _ = tx.send(WaEvent::NewMessage(row)).await;
+    dirty.notify_one();
+}
+
+/// After an edit/revoke landed in the store: recompute the chat-list preview,
+/// re-read the row and push it to the UI (shared by our own actions and by
+/// incoming protocol messages).
+async fn push_updated_row(
+    store: &Store,
+    tx: &Sender<WaEvent>,
+    dirty: &Notify,
+    chat: String,
+    id: String,
+) {
+    if let Err(e) = store.refresh_chat_preview(chat.clone()).await {
+        warn!("refresh_chat_preview failed: {e:?}");
+    }
+    match store.load_message(chat, id).await {
+        Ok(Some(row)) => {
+            let _ = tx.send(WaEvent::MessageUpdated { row }).await;
+        }
+        Ok(None) => {}
+        Err(e) => warn!("load_message failed: {e:?}"),
+    }
     dirty.notify_one();
 }
 
@@ -1431,9 +1784,24 @@ async fn handle_event(
                             })
                         })
                         .collect();
+                    // Link previews to persist (columns live outside insert_messages).
+                    #[allow(clippy::type_complexity)]
+                    let links: Vec<(String, String, String, String, String, Vec<u8>)> = msgs
+                        .iter()
+                        .filter(|(m, ..)| !m.link_url.is_empty())
+                        .map(|(m, ..)| {
+                            (m.chat_jid.clone(), m.id.clone(), m.link_url.clone(),
+                             m.link_title.clone(), m.link_desc.clone(), m.link_thumb.clone())
+                        })
+                        .collect();
                     let rows: Vec<MessageRow> = msgs.into_iter().map(|(m, ..)| m).collect();
                     if let Err(e) = store.insert_messages(rows).await {
                         warn!("insert_messages failed: {e:?}");
+                    }
+                    for (chat_jid, id, url, title, desc, thumb) in links {
+                        if let Err(e) = store.set_link_preview(chat_jid, id, url, title, desc, thumb).await {
+                            warn!("set_link_preview (history) failed: {e:?}");
+                        }
                     }
                     for (m, bytes) in media {
                         if let Err(e) = store.set_media(m.chat_jid.clone(), m.id.clone(), bytes).await {
@@ -1485,6 +1853,58 @@ async fn handle_event(
                     }
                 }
 
+                // Edits and revokes arrive as regular messages wrapping a
+                // ProtocolMessage (possibly nested under device_sent for our own
+                // actions fanned out from the phone; encrypted edits are already
+                // normalized to this shape by the library). Apply them to the
+                // stored target row and stop — they never render as bubbles.
+                {
+                    use wacore::proto_helpers::MessageExt;
+                    if let Some(pm) = &msg.get_base_message().protocol_message {
+                        use wa::message::protocol_message::Type as PmType;
+                        let typ = pm.r#type.and_then(|t| PmType::try_from(t).ok());
+                        let target = pm.key.as_ref().and_then(|k| k.id.clone());
+                        if let Some(target_id) = target {
+                            match typ {
+                                Some(PmType::Revoke) => {
+                                    match store.apply_revoke(chat.clone(), target_id.clone()).await {
+                                        Ok(true) => {
+                                            push_updated_row(&store, &tx, &dirty, chat, target_id).await;
+                                        }
+                                        Ok(false) => info!("revoke for unknown message {target_id}"),
+                                        Err(e) => warn!("apply_revoke (live) failed: {e:?}"),
+                                    }
+                                }
+                                Some(PmType::MessageEdit) => {
+                                    if let Some(edited) = pm.edited_message.as_deref() {
+                                        let new_body = preview::message_preview(edited);
+                                        if !new_body.is_empty() {
+                                            match store
+                                                .apply_edit(chat.clone(), target_id.clone(), new_body)
+                                                .await
+                                            {
+                                                Ok(true) => {
+                                                    // The edited content may carry its own preview.
+                                                    if let Some((url, title, desc, thumb)) = link_preview_of(edited) {
+                                                        let _ = store
+                                                            .set_link_preview(chat.clone(), target_id.clone(), url, title, desc, thumb)
+                                                            .await;
+                                                    }
+                                                    push_updated_row(&store, &tx, &dirty, chat, target_id).await;
+                                                }
+                                                Ok(false) => info!("edit for unknown message {target_id}"),
+                                                Err(e) => warn!("apply_edit (live) failed: {e:?}"),
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        return;
+                    }
+                }
+
                 let body = preview::message_preview(msg);
                 // Skip system/protocol messages (empty preview): no bubble, no
                 // chat-list preview change.
@@ -1507,6 +1927,7 @@ async fn handle_event(
                         .as_ref()
                         .map(|(sender, text)| (text.clone(), reply_name(sender)))
                         .unwrap_or_default();
+                    let link = link_preview_of(msg);
                     let row = MessageRow {
                         id: info.id.clone(),
                         chat_jid: chat.clone(),
@@ -1532,6 +1953,12 @@ async fn handle_event(
                         media_name: m_name.clone(),
                         media_thumb: m_thumb.clone(),
                         media_size: m_size,
+                        edited: false,
+                        revoked: false,
+                        link_url: link.as_ref().map(|l| l.0.clone()).unwrap_or_default(),
+                        link_title: link.as_ref().map(|l| l.1.clone()).unwrap_or_default(),
+                        link_desc: link.as_ref().map(|l| l.2.clone()).unwrap_or_default(),
+                        link_thumb: link.as_ref().map(|l| l.3.clone()).unwrap_or_default(),
                     };
                     // Insert first: a `false` means this is the self-fanout echo of
                     // a message we already inserted on send — skip the preview bump
@@ -1570,6 +1997,14 @@ async fn handle_event(
                                 .await
                             {
                                 warn!("set_reply (live) failed: {e:?}");
+                            }
+                        }
+                        if let Some((url, title, desc, thumb)) = link {
+                            if let Err(e) = store
+                                .set_link_preview(chat.clone(), info.id.clone(), url, title, desc, thumb)
+                                .await
+                            {
+                                warn!("set_link_preview (live) failed: {e:?}");
                             }
                         }
                         if let Err(e) = store
@@ -1729,6 +2164,9 @@ async fn handle_event(
                         Some(n) => Some(n),
                         None => {
                             let n = match chat.parse::<whatsapp_rust::Jid>() {
+                                // Skip the metadata query while rate-limited; the group
+                                // tick just won't aggregate until the count is known later.
+                                Ok(_) if usync_in_cooldown() => None,
                                 Ok(p) => client
                                     .groups()
                                     .get_metadata(&p)
@@ -1928,6 +2366,11 @@ async fn fetch_group_subject(client: &Client, store: &Store, jid: &str) -> bool 
     let Ok(parsed) = jid.parse::<whatsapp_rust::Jid>() else {
         return false;
     };
+    // Respect the post-429 cooldown: don't pile more group-metadata queries onto a
+    // rate-limited connection.
+    if usync_in_cooldown() {
+        return false;
+    }
     match client.groups().get_metadata(&parsed).await {
         Ok(meta) if !meta.subject.is_empty() => {
             match store.set_group_subject(jid.to_string(), meta.subject).await {
@@ -1941,6 +2384,9 @@ async fn fetch_group_subject(client: &Client, store: &Store, jid: &str) -> bool 
         Ok(_) => false,
         Err(e) => {
             warn!("group subject fetch failed for {jid}: {e:?}");
+            if rate_limited(&e) {
+                begin_usync_cooldown();
+            }
             false
         }
     }
@@ -1988,20 +2434,6 @@ async fn canonical_chat_jid(client: &Client, jid: &whatsapp_rust::Jid) -> String
         }
     }
     jid.to_string()
-}
-
-/// Strips a JID's device suffix (`user:NN@server` → `user@server`) so all of a
-/// person's linked devices collapse to one sender identity. A group member posting
-/// from multiple devices otherwise appears as several "users", and the
-/// device-suffixed JID misses the contact-name join (showing a bare number).
-fn base_jid(jid: &str) -> String {
-    match jid.split_once('@') {
-        Some((user, server)) => {
-            let user = user.split(':').next().unwrap_or(user);
-            format!("{user}@{server}")
-        }
-        None => jid.to_string(),
-    }
 }
 
 /// Like [`canonical_chat_jid`] but from a string JID (history-sync conversation
@@ -2100,6 +2532,7 @@ fn conv_to_messages(
                 .as_ref()
                 .map(|(sender, text)| (text.clone(), reply_name(sender)))
                 .unwrap_or_default();
+            let link = link_preview_of(msg);
             let row = MessageRow {
                 id,
                 chat_jid: chat.to_string(),
@@ -2121,10 +2554,31 @@ fn conv_to_messages(
                 media_name: m_name,
                 media_thumb: m_thumb,
                 media_size: m_size,
+                edited: false,
+                revoked: false,
+                link_url: link.as_ref().map(|l| l.0.clone()).unwrap_or_default(),
+                link_title: link.as_ref().map(|l| l.1.clone()).unwrap_or_default(),
+                link_desc: link.as_ref().map(|l| l.2.clone()).unwrap_or_default(),
+                link_thumb: link.map(|l| l.3).unwrap_or_default(),
             };
             Some((row, media, reply))
         })
         .collect()
+}
+
+/// Link preview carried by an extended-text message, as `(url, title,
+/// description, jpeg thumbnail)`. Requires a title or description — bare
+/// extended-text replies also have the struct but no preview payload.
+fn link_preview_of(msg: &wa::Message) -> Option<(String, String, String, Vec<u8>)> {
+    use wacore::proto_helpers::MessageExt;
+    let et = msg.get_base_message().extended_text_message.as_deref()?;
+    let title = et.title.clone().unwrap_or_default();
+    let desc = et.description.clone().unwrap_or_default();
+    let url = et.matched_text.clone().unwrap_or_default();
+    if url.is_empty() || (title.is_empty() && desc.is_empty()) {
+        return None;
+    }
+    Some((url, title, desc, et.jpeg_thumbnail.clone().unwrap_or_default()))
 }
 
 /// Media kind + metadata for a downloadable media message, as
@@ -2141,8 +2595,11 @@ fn media_meta(msg: &wa::Message) -> Option<(i32, String, String, Vec<u8>, i64)> 
         ));
     }
     if let Some(m) = &msg.video_message {
+        // WhatsApp GIFs are mp4 videos flagged gif_playback: kind 6 so the UI
+        // can loop them and label them apart from real videos.
+        let kind = if m.gif_playback.unwrap_or(false) { 6 } else { 2 };
         return Some((
-            2,
+            kind,
             m.mimetype.clone().unwrap_or_default(),
             String::new(),
             m.jpeg_thumbnail.clone().unwrap_or_default(),
@@ -2195,9 +2652,42 @@ fn doc_ext_from(name: &str, mime: &str) -> String {
     ext_from_mime(Some(mime), "bin")
 }
 
+/// Extensions for common MIME types whose subtype doesn't pass the generic
+/// heuristic (too long / non-alphanumeric). Without a real extension the cached
+/// file lands as `.bin` and the opener can't resolve the right application.
+const MIME_EXT: &[(&str, &str)] = &[
+    (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "docx",
+    ),
+    (
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "xlsx",
+    ),
+    (
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "pptx",
+    ),
+    ("application/msword", "doc"),
+    ("application/vnd.ms-excel", "xls"),
+    ("application/vnd.ms-powerpoint", "ppt"),
+    ("application/vnd.oasis.opendocument.text", "odt"),
+    ("application/vnd.oasis.opendocument.spreadsheet", "ods"),
+    ("image/svg+xml", "svg"),
+    ("text/plain", "txt"),
+    ("audio/mpeg", "mp3"),
+    ("video/quicktime", "mov"),
+];
+
 /// A lowercase file extension for a MIME type (subtype after `/`, params
 /// stripped), falling back to `default` when unknown.
 fn ext_from_mime(mime: Option<&str>, default: &str) -> String {
+    if let Some(m) = mime {
+        let m = m.split(';').next().unwrap_or(m).trim().to_ascii_lowercase();
+        if let Some((_, ext)) = MIME_EXT.iter().find(|(k, _)| *k == m) {
+            return ext.to_string();
+        }
+    }
     mime.and_then(|m| m.split('/').nth(1))
         .map(|s| s.split(';').next().unwrap_or(s).trim().to_ascii_lowercase())
         .filter(|s| !s.is_empty() && s.len() <= 5 && s.chars().all(|c| c.is_ascii_alphanumeric()))

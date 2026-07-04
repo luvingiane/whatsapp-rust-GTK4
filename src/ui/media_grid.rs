@@ -1,5 +1,5 @@
-//! The chat media gallery (opened from the profile's "Media" row): a tabbed
-//! window with Photos / Videos / Documents / Links. One instance at a time.
+//! The chat media gallery (opened from the profile's "Media" row), shown in the
+//! right side pane: tabs for Photos / Videos / Documents / Links.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -15,22 +15,21 @@ use crate::ui::thread::{doc_icon, fmt_bytes, scaled_texture};
 /// download, so an incoming `InlineReady` can fill the right tile.
 pub type TileMap = Rc<RefCell<HashMap<String, gtk::Picture>>>;
 
-/// Builds and presents the gallery over `parent`. `on_open(id, kind)` fires when a
-/// photo/video/document is clicked; `on_link(url)` when a link is clicked.
+/// Builds the tabbed gallery widget for the side pane. `on_open(id, kind)` fires
+/// when a photo/video/document is clicked; `on_link(url)` when a link is clicked.
 /// `on_need(id)` requests an on-demand download for a photo tile with nothing to
 /// show; such tiles are registered in `tiles` so the caller can fill them later.
 #[allow(clippy::too_many_arguments)]
-pub fn present(
-    parent: &adw::ApplicationWindow,
+pub fn build(
     photos: Vec<MediaEntry>,
     videos: Vec<MediaEntry>,
     documents: Vec<MediaEntry>,
-    links: Vec<String>,
+    links: Vec<crate::model::LinkItem>,
     on_open: Rc<dyn Fn(String, i32)>,
     on_link: Rc<dyn Fn(String)>,
     on_need: Rc<dyn Fn(String)>,
     tiles: TileMap,
-) -> adw::Window {
+) -> gtk::Widget {
     let stack = adw::ViewStack::new();
     stack.add_titled_with_icon(
         &media_flow(photos, 1, on_open.clone(), on_need.clone(), tiles.clone()),
@@ -57,41 +56,20 @@ pub fn present(
         "web-browser-symbolic",
     );
 
+    // Narrow policy: the side pane is ~340 px, a Wide switcher wouldn't fit.
     let switcher = adw::ViewSwitcher::builder()
         .stack(&stack)
-        .policy(adw::ViewSwitcherPolicy::Wide)
+        .policy(adw::ViewSwitcherPolicy::Narrow)
         .build();
-    let header = adw::HeaderBar::new();
-    header.set_title_widget(Some(&switcher));
+    switcher.set_margin_top(4);
+    switcher.set_margin_start(6);
+    switcher.set_margin_end(6);
 
-    let tb = adw::ToolbarView::new();
-    tb.add_top_bar(&header);
-    tb.set_content(Some(&stack));
-
-    let window = adw::Window::builder()
-        .transient_for(parent)
-        .default_width(640)
-        .default_height(560)
-        .title("Media")
-        .content(&tb)
-        .build();
-
-    let keys = gtk::EventControllerKey::new();
-    {
-        let window = window.clone();
-        keys.connect_key_pressed(move |_, key, _, _| {
-            if key == gtk::gdk::Key::Escape {
-                window.close();
-                gtk::glib::Propagation::Stop
-            } else {
-                gtk::glib::Propagation::Proceed
-            }
-        });
-    }
-    window.add_controller(keys);
-
-    window.present();
-    window
+    stack.set_vexpand(true);
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    root.append(&switcher);
+    root.append(&stack);
+    root.upcast()
 }
 
 /// A scrollable grid of photo/video thumbnails (kind 1 photo / 2 video).
@@ -157,7 +135,7 @@ fn media_flow(
         aspect.set_child(Some(&pic));
         let frame = gtk::Overlay::new();
         frame.set_child(Some(&aspect));
-        if kind == 2 {
+        if it.kind == 2 {
             let play = gtk::Image::from_icon_name("media-playback-start-symbolic");
             play.set_pixel_size(36);
             play.add_css_class("media-play-overlay");
@@ -165,13 +143,32 @@ fn media_flow(
             play.set_valign(gtk::Align::Center);
             play.set_can_target(false);
             frame.add_overlay(&play);
+        } else if it.kind == 6 {
+            let chip = gtk::Label::new(Some("GIF"));
+            chip.add_css_class("media-time");
+            chip.set_halign(gtk::Align::Center);
+            chip.set_valign(gtk::Align::Center);
+            chip.set_can_target(false);
+            frame.add_overlay(&chip);
+        }
+        // File size chip on video/GIF tiles (photos keep a clean look).
+        if matches!(it.kind, 2 | 6) && it.size > 0 {
+            let size = gtk::Label::new(Some(&fmt_bytes(it.size)));
+            size.add_css_class("media-time");
+            size.set_halign(gtk::Align::End);
+            size.set_valign(gtk::Align::End);
+            size.set_margin_end(4);
+            size.set_margin_bottom(4);
+            size.set_can_target(false);
+            frame.add_overlay(&size);
         }
         frame.set_cursor_from_name(Some("pointer"));
         {
             let on_open = on_open.clone();
             let id = it.id.clone();
+            let item_kind = it.kind;
             let click = gtk::GestureClick::new();
-            click.connect_released(move |_, _, _, _| on_open(id.clone(), kind));
+            click.connect_released(move |_, _, _, _| on_open(id.clone(), item_kind));
             frame.add_controller(click);
         }
         flow.append(&frame);
@@ -184,7 +181,7 @@ fn media_flow(
         .upcast()
 }
 
-/// A list of documents (icon + name + size), each opening on click.
+/// A list of documents (icon by type + name + size · date), each opening on click.
 fn document_list(items: Vec<MediaEntry>, on_open: Rc<dyn Fn(String, i32)>) -> gtk::Widget {
     if items.is_empty() {
         return empty_placeholder("Nessun documento");
@@ -193,12 +190,20 @@ fn document_list(items: Vec<MediaEntry>, on_open: Rc<dyn Fn(String, i32)>) -> gt
     list.add_css_class("boxed-list");
     list.set_selection_mode(gtk::SelectionMode::None);
     for it in items {
+        let mut sub = fmt_bytes(it.size);
+        if let Some(date) = fmt_date(it.ts) {
+            if sub.is_empty() {
+                sub = date;
+            } else {
+                sub = format!("{sub} · {date}");
+            }
+        }
         let row = adw::ActionRow::builder()
             .title(if it.name.is_empty() { "Documento" } else { &it.name })
-            .subtitle(&fmt_bytes(it.size))
+            .subtitle(&sub)
             .activatable(true)
             .build();
-        row.add_prefix(&gtk::Image::from_icon_name(doc_icon("")));
+        row.add_prefix(&gtk::Image::from_icon_name(doc_icon(&it.mime)));
         {
             let on_open = on_open.clone();
             let id = it.id.clone();
@@ -209,25 +214,69 @@ fn document_list(items: Vec<MediaEntry>, on_open: Rc<dyn Fn(String, i32)>) -> gt
     wrap_list(list)
 }
 
-/// A list of links, each opening in the browser on click.
-fn link_list(links: Vec<String>, on_link: Rc<dyn Fn(String)>) -> gtk::Widget {
+/// The shared links, richest first: a thumbnail/globe + title (or URL) + host
+/// card per link, each opening in the browser on click.
+fn link_list(links: Vec<crate::model::LinkItem>, on_link: Rc<dyn Fn(String)>) -> gtk::Widget {
     if links.is_empty() {
         return empty_placeholder("Nessun link");
     }
     let list = gtk::ListBox::new();
     list.add_css_class("boxed-list");
     list.set_selection_mode(gtk::SelectionMode::None);
-    for url in links {
-        let row = adw::ActionRow::builder().title(&url).activatable(true).build();
-        row.add_prefix(&gtk::Image::from_icon_name("web-browser-symbolic"));
+    for l in links {
+        let row = adw::ActionRow::builder()
+            .title(if l.title.is_empty() { &l.url } else { &l.title })
+            .subtitle(host_of(&l.url))
+            .activatable(true)
+            .build();
+        row.set_title_lines(2);
+        if !l.desc.is_empty() {
+            row.set_tooltip_text(Some(&l.desc));
+        }
+        let thumb_tex = (!l.thumb.is_empty())
+            .then(|| gtk::gdk::Texture::from_bytes(&gtk::glib::Bytes::from(&l.thumb)).ok())
+            .flatten();
+        match thumb_tex {
+            Some(tex) => {
+                let pic = gtk::Picture::new();
+                pic.set_size_request(48, 48);
+                pic.set_content_fit(gtk::ContentFit::Cover);
+                pic.set_paintable(Some(&tex));
+                pic.add_css_class("media-thumb");
+                row.add_prefix(&pic);
+            }
+            None => row.add_prefix(&gtk::Image::from_icon_name("web-browser-symbolic")),
+        }
         {
             let on_link = on_link.clone();
-            let url = url.clone();
+            let url = l.url.clone();
             row.connect_activated(move |_| on_link(url.clone()));
         }
         list.append(&row);
     }
     wrap_list(list)
+}
+
+/// The host part of a URL (`https://a.b/c` → `a.b`), for link subtitles.
+fn host_of(url: &str) -> String {
+    url.split("://")
+        .nth(1)
+        .unwrap_or(url)
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// A short `gg/mm/aa` date for a unix timestamp (`None` when unknown).
+fn fmt_date(ts: i64) -> Option<String> {
+    if ts <= 0 {
+        return None;
+    }
+    gtk::glib::DateTime::from_unix_local(ts)
+        .ok()
+        .and_then(|d| d.format("%d/%m/%y").ok())
+        .map(|s| s.to_string())
 }
 
 fn wrap_list(list: gtk::ListBox) -> gtk::Widget {
