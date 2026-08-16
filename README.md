@@ -1,4 +1,4 @@
-# WhatsApp Rust GTK4 🦀💬
+# WhatsApp Rust GTK4
 
 > A **native, lightweight WhatsApp client for Linux** — built in pure **Rust** with
 > **GTK4 + libadwaita**, so it looks and feels like a real GNOME app.
@@ -79,13 +79,16 @@ This is a roadmap, not a finished feature list — it moves fast.
   downloadable.
 - 🪶 Goal throughout: stay light and native (one Rust process, no Chromium).
 
-## 🤖 Heads-up: this is "vibecoded"
+## 🤖 Heads-up: this is "partially vibecoded"
 
-Honesty first: this project is being built largely through **AI-assisted "vibecoding"**
-(with Claude). That means it gets written fast and iteratively — so expect rough edges,
-occasional weird code, and bugs. I'm learning in the open and showing the cooking process,
-not shipping a polished product (yet). **Apologies in advance for the jank** 🙏 — patience,
-issues, and fixes are all very welcome.
+**Honesty first:** this project is built largely through **AI-assisted "vibecoding"** (with Claude) — written fast and iteratively, but every release is heavily tested.
+
+This isn't my first project with these tools. Years of practice taught me proper debugging and how to ship a stable product. My goal is to release something useful, bug-free, and well made — proof that not every AI-written app is garbage.
+
+**Legal note (EU AI Act):** despite the "vibecoded" origin, this software is not an AI system under Regulation (EU) 2024/1689. Art. 3(1) and Recital 12 require inference capability — deriving outputs from learned models/algorithms — to qualify as AI. This project runs on fully rule-based, deterministic logic with no inference, no learning, no adaptive behavior. How it was written is irrelevant to classification; only what the deployed software does matters.
+
+*Sources: Reg. (EU) 2024/1689, Art. 3(1) + Recital 12; European Commission, Guidelines on the AI system definition, 6 Feb 2025.*
+
 
 ## ⚠️ Important disclaimer
 
