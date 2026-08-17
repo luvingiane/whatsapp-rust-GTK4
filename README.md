@@ -25,6 +25,7 @@ crate (an independent Rust implementation of the WhatsApp Web protocol).
 This is a roadmap, not a finished feature list — it moves fast.
 
 **✅ Working today**
+note : features with ❗️means that works but not as intended
 
 - 📱 QR login, persistent across restarts (reconnects without re-scanning).
 - 💬 Chat list + conversations: message history (with scroll-up backfill) and live
@@ -51,17 +52,20 @@ This is a roadmap, not a finished feature list — it moves fast.
   big picture, status/description, a media shortcut, block/unblock (1:1), and the
   participants (group) or groups-in-common (1:1), each clickable and resolved to the real
   phone-number identity.
-- ✔️ **Delivery / read ticks** (✓ sent, ✓✓ delivered). The blue "read" tick on your
+- (❗️) ✔️ **Delivery / read ticks** (✓ sent, ✓✓ delivered). The blue "read" tick on your
   **own** sent messages is hidden to mirror WhatsApp's "read receipts off" privacy
   setting (flip one flag to show it again).
-- 🔄 **Two-way read sync**: reading a chat here clears its unread on your phone /
+- (❗️) 🔄 **Two-way read sync**: reading a chat here clears its unread on your phone /
   WhatsApp Web, and reading it there clears it here.
 - 🟢 **Presence**: reports online only while the window is focused/active and "away"
   when unfocused or idle, so your phone resumes its own notifications when you step away.
-- 🗂️ **Archived chats** view with an unread count; read chats clear their unread badge.
+- (❗️) 🗂️ **Archived chats** view with an unread count; read chats clear their unread badge.
 - 🧹 **Identity de-duplication**: WhatsApp's `@lid`, phone-number and multi-device
   (`:NN`) forms of the same person are collapsed, so a contact — and their
   messages/media — shows up once, in the chat list and in group message bubbles.
+
+❗️- sync doesnt work properly, same syncing archived chats, actually you have to manually archive chats.
+for unknown reasons the app shows blue ticks (in private chats) even i've disabled years ago, actually blue ticks are disabled client-side.
 
 **🚧 Not there yet**
 
